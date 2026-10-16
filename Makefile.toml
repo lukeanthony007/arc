@@ -1,6 +1,0 @@
-[tasks.watch]
-script = [
-  "cargo test --release -- --nocapture",
-  "cargo build --release",
-  "cp target/release/arc ~/bin/arc",
-]
