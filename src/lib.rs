@@ -9,6 +9,7 @@ pub mod bundle;
 pub mod constrained;
 pub mod crypto;
 pub mod devices;
+pub mod diagnostics;
 pub mod enrollment;
 pub mod format;
 pub mod fragments;

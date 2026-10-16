@@ -26,15 +26,23 @@ impl Store {
             .mode(0o700)
             .create(path)
             .with_context(|| format!("create store {}", path.display()))?;
-        for name in DIRS {
-            let p = path.join(name);
-            fs::DirBuilder::new().mode(0o700).create(&p)?;
-            sync_dir(path)?;
+        let result = (|| -> Result<Self> {
+            for name in DIRS {
+                let p = path.join(name);
+                fs::DirBuilder::new().mode(0o700).create(&p)?;
+                sync_dir(path)?;
+            }
+            sync_dir(parent)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+            })
+        })();
+        // This call exclusively created the root; never remove a preexisting path.
+        if result.is_err() {
+            let _ = fs::remove_dir_all(path);
+            let _ = sync_dir(parent);
         }
-        sync_dir(parent)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-        })
+        result
     }
     pub fn open(path: &Path) -> Result<Self> {
         ensure_no_symlink_components(path)?;

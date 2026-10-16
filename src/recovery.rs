@@ -9,7 +9,10 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
-use minicbor::{Decoder, Encoder};
+use minicbor::Decoder;
+#[cfg(test)]
+use minicbor::Encoder;
+#[cfg(test)]
 use rand::{RngCore, rngs::OsRng};
 use std::{
     fs,
@@ -19,9 +22,23 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[path = "recovery_stream.rs"]
+mod stream;
+
+/// New backups use independently authenticated streaming ARCRCV3 records.
+pub(crate) fn export(
+    store: &Store,
+    genesis: &Id,
+    destination: &Path,
+    password: &str,
+) -> Result<()> {
+    stream::export(store, genesis, destination, password)
+}
+
 const MAGIC: &[u8; 8] = b"ARCRCV2\n";
 const MAX_COUNT: usize = 16_384;
 const MAX_TOTAL: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 const MAX_OBJECT_SCAN: usize = MAX_COUNT * 4;
 const CONTROLS: &[&str] = &["genesis", "keys", "policy", "keys-history"];
 
@@ -37,13 +54,9 @@ fn key(password: &str, salt: &[u8; 16]) -> Result<Zeroizing<[u8; 32]>> {
     Ok(result)
 }
 
-/// Export every immutable object and explicitly selected identity controls; no plaintext files.
-pub(crate) fn export(
-    store: &Store,
-    genesis: &Id,
-    destination: &Path,
-    password: &str,
-) -> Result<()> {
+/// Legacy writer retained only to exercise ARCRCV2 read compatibility.
+#[cfg(test)]
+fn export_v2(store: &Store, genesis: &Id, destination: &Path, password: &str) -> Result<()> {
     let mut controls: Vec<(&str, Vec<u8>)> = Vec::new();
     for name in CONTROLS {
         let path = store.path().join("control").join(name);
@@ -191,6 +204,21 @@ pub(crate) fn export(
 
 /// Validate the complete encrypted package before staging a fresh destination.
 pub fn recover(path: &Path, kit: &Path, expected: &Id, password: &str) -> Result<()> {
+    let mut probe = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(kit)?;
+    ensure!(
+        probe.metadata()?.is_file(),
+        "recovery kit must be a regular file"
+    );
+    let mut probe_magic = [0; 8];
+    probe.read_exact(&mut probe_magic)?;
+    if &probe_magic == stream::MAGIC {
+        drop(probe);
+        return stream::recover(path, kit, expected, password);
+    }
+    drop(probe);
     let mut f = fs::OpenOptions::new()
         .read(true)
         .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
@@ -349,6 +377,11 @@ pub fn recover(path: &Path, kit: &Path, expected: &Id, password: &str) -> Result
     };
     ensure!(controls.contains_key("keys"), "missing key material");
     if let Some((_, p, chain)) = &policy {
+        let secrets = crate::crypto::Secrets::unlock(
+            &genesis.collection,
+            controls.get("keys").unwrap(),
+            password,
+        )?;
         let hist = controls
             .get("keys-history")
             .map(Vec::as_slice)
@@ -375,17 +408,13 @@ pub fn recover(path: &Path, kit: &Path, expected: &Id, password: &str) -> Result
                 );
                 let old = crate::crypto::Secrets::unlock(&genesis.collection, locked, password)?;
                 ensure!(
-                    chain[&id].members.iter().any(|m| m.key == old.root()),
+                    old.root() == secrets.root()
+                        && chain[&id].members.iter().any(|m| m.key == old.root()),
                     "historical key does not match policy"
                 );
             }
             ensure!(hd.position() == hist.len(), "trailing policy key history");
         }
-        let secrets = crate::crypto::Secrets::unlock(
-            &genesis.collection,
-            controls.get("keys").unwrap(),
-            password,
-        )?;
         ensure!(
             p.members
                 .iter()
@@ -499,4 +528,96 @@ pub fn recover(path: &Path, kit: &Path, expected: &Id, password: &str) -> Result
         let _ = fs::remove_dir_all(&stage);
     }
     result
+}
+
+#[cfg(test)]
+mod compatibility {
+    use super::*;
+    #[test]
+    fn v2_backup_remains_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = temp.path().join("node");
+        let genesis = crate::app::init(&node, "legacy-v2-password").unwrap();
+        let store = Store::open(&node).unwrap();
+        let kit = temp.path().join("v2.arc");
+        export_v2(&store, &genesis, &kit, "legacy-v2-password").unwrap();
+        let destination = temp.path().join("recovered");
+        recover(&destination, &kit, &genesis, "legacy-v2-password").unwrap();
+        assert_eq!(
+            crate::app::pinned(&Store::open(&destination).unwrap())
+                .unwrap()
+                .0,
+            genesis
+        );
+        assert!(Store::open(&destination).unwrap().head().unwrap().is_none());
+    }
+    #[test]
+    fn v2_rejects_mixed_historical_signing_identities() {
+        use crate::{
+            crypto::{DeviceSecrets, Secrets},
+            policy::{Member, Policy, Role},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let node = temp.path().join("mixed");
+        let store = Store::create(&node).unwrap();
+        let collection = [1; 32];
+        let root = Secrets::from_member([7; 32], [9; 32]);
+        let reader = Secrets::from_member([8; 32], [9; 32]);
+        let genesis = store.put(&root.sign_genesis(collection).unwrap()).unwrap();
+        let policy = Policy::new(
+            collection,
+            root.root(),
+            0,
+            None,
+            vec![
+                Member {
+                    key: root.root(),
+                    role: Role::Writer,
+                    revoked: false,
+                },
+                Member {
+                    key: reader.root(),
+                    role: Role::Reader,
+                    revoked: false,
+                },
+            ],
+            vec![],
+            &[7; 32],
+        )
+        .unwrap();
+        let pid = store.put(&policy.encode().unwrap()).unwrap();
+        store.write_new_control("genesis", &genesis).unwrap();
+        store.write_new_control("policy", &pid).unwrap();
+        store
+            .write_new_control("keys", &reader.lock(&collection, "mixed-password").unwrap())
+            .unwrap();
+        let mut history = Vec::new();
+        Encoder::new(&mut history)
+            .array(2)
+            .unwrap()
+            .u8(1)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .bytes(&pid)
+            .unwrap()
+            .bytes(&root.lock(&collection, "mixed-password").unwrap())
+            .unwrap();
+        store.write_new_control("keys-history", &history).unwrap();
+        fs::write(
+            node.join("device-key"),
+            DeviceSecrets::from_seed([8; 32])
+                .lock("mixed-password")
+                .unwrap(),
+        )
+        .unwrap();
+        let kit = temp.path().join("mixed-v2.arc");
+        export_v2(&store, &genesis, &kit, "mixed-password").unwrap();
+        let destination = temp.path().join("recovered");
+        let error = recover(&destination, &kit, &genesis, "mixed-password").unwrap_err();
+        assert!(error.to_string().contains("historical key"));
+        assert!(!destination.exists());
+    }
 }

@@ -18,7 +18,7 @@ use std::{
 pub const MAX_PARTIALS: usize = 128;
 pub const MAX_STAGED: u64 = 32 * 1024 * 1024;
 pub const MAX_FRAGMENTS: u32 = 16_384;
-const MAX_STATE: usize = MAX_OBJECT + MAX_FRAGMENTS as usize * 48 + 256;
+pub(crate) const MAX_STATE: usize = MAX_OBJECT + MAX_FRAGMENTS as usize * 48 + 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {

@@ -11,7 +11,7 @@ arc recovery-export NODE BACKUP
 arc recover NEW_NODE BACKUP --trust-genesis GENESIS_ID
 ```
 
-Both commands prompt for the node's password. Authenticate and retain the genesis ID separately. A new `ARCRCV2` backup includes the node's immutable object inventory, the signed policy checkpoint and chain contained in that inventory, current and retained historical encrypted keys, and its member device key where applicable. The complete payload is authenticated and encrypted using Argon2id and XChaCha20-Poly1305. This differs from an `export` transfer bundle, which excludes secret keys.
+Both commands prompt for the node's password. Authenticate and retain the genesis ID separately. A new `ARCRCV3` backup includes the node's immutable object inventory, the signed policy checkpoint and chain contained in that inventory, current and retained historical encrypted keys, and its member device key where applicable. Bounded records and a mandatory final commitment are authenticated and encrypted using Argon2id and XChaCha20-Poly1305. This differs from an `export` transfer bundle, which excludes secret keys. Older `ARCRCV2` complete backups remain readable.
 
 The backup includes ciphertext already imported into that node, even if it is not currently authorized for publication. Having those bytes does not authorize them. Snapshots still undergo the ordinary signature, policy and content verification when used. A backup can only preserve objects and historical keys the node actually holds; it cannot repair preexisting missing objects or reconstruct keys never received.
 
@@ -19,7 +19,7 @@ Recovery validates the container and identities, builds a private sibling stagin
 
 Recovery recreates the backed-up identity. Retire the original device before using the recovered identity to publish. A member backup retains that member's permissions, not the administrator's authority. A backup's policy is a dated trusted checkpoint, not proof that no later revocation exists: reconcile with a trusted current peer or administrator before publishing. Existing `ARCKEY1` kits remain readable; they contain keys only and require separately retained data bundles.
 
-Backups omit transport identities, unfinished transfers and pending membership transactions. Keep network identity files separately or create and re-pin new ones. Export refuses a pending membership transition; repair it first. The encoded plaintext payload is limited to 64 MiB and 16,384 objects, including container overhead; memory use is several times the payload while encrypting or decoding. This is not a streaming large-archive format.
+Backups omit transport identities, unfinished transfers and pending membership transactions. Keep network identity files separately or create and re-pin new ones. Export refuses a pending membership transition; repair it first. New V3 backups stream up to 16 GiB of encoded data and 1,000,000 objects, retaining bounded frames and controls rather than the complete inventory in memory. Individual objects remain limited to 1 MiB. Other capture, history and exchange bounds still apply. V2 reading retains its earlier buffered 64 MiB/16,384-object limit. See [streaming framing and limits](release-readiness.md#streaming-complete-recovery).
 
 ## Repair an interrupted membership update
 

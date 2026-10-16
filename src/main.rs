@@ -57,6 +57,10 @@ enum Command {
         #[arg(long)]
         trust_genesis: String,
     },
+    /// Explain local identity, working version, branches and incomplete work without unlocking.
+    Status { node: PathBuf },
+    /// Check local ciphertext integrity and report actionable findings; never repairs or decrypts.
+    Doctor { node: PathBuf },
     /// List locally known snapshots and their status.
     History { node: PathBuf },
     /// Compare two authorized snapshots.
@@ -301,6 +305,17 @@ fn run(cli: Cli) -> Result<()> {
             app::recover(&node, &kit, &format::parse_id(&trust_genesis)?, &secret)?;
             println!(
                 "recovered the backed-up device identity; policy freshness beyond the backup is unknown; retire the original device before publishing"
+            );
+        }
+        Command::Status { node } => {
+            println!("{}", arc_store::diagnostics::status(&node)?);
+        }
+        Command::Doctor { node } => {
+            let report = arc_store::diagnostics::doctor(&node)?;
+            print!("{report}");
+            ensure!(
+                !report.has_errors(),
+                "node diagnostics found errors; no changes made"
             );
         }
         Command::History { node } => {

@@ -137,9 +137,13 @@ pub(crate) fn load_policy(
     match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             ensure!(metadata.is_file(), "invalid policy pin");
-            crate::policy::Policy::load(store, &genesis.root)?
-                .context("policy pin could not be read")
-                .map(Some)
+            let policy = crate::policy::Policy::load(store, &genesis.root)?
+                .context("policy pin could not be read")?;
+            ensure!(
+                policy.collection == genesis.collection,
+                "policy collection does not match pinned genesis"
+            );
+            Ok(Some(policy))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -1003,7 +1007,7 @@ pub fn recover(path: &Path, kit: &Path, expected_genesis: &Id, password: &str) -
     ensure!(input.metadata()?.is_file(), "invalid recovery kit file");
     let mut magic = [0; 8];
     input.read_exact(&mut magic)?;
-    if &magic == b"ARCRCV2\n" {
+    if &magic == b"ARCRCV2\n" || &magic == b"ARCRCV3\n" {
         drop(input);
         return crate::recovery::recover(path, kit, expected_genesis, password);
     }

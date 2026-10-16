@@ -29,6 +29,7 @@ Storage and exchange need no mandatory server. Each private collection currently
 - **Offline and live exchange.** Export opaque transfer bundles or connect to a peer whose transport key you have explicitly verified. Live synchronization requests missing objects.
 - **Interrupted-transfer progress.** Durable partial objects survive reconnects and receiver restarts in TCP, RFCOMM and constrained simulations. Reconnects request missing fragments, and only complete verified objects enter the store.
 - **Recovery and repair.** Create a password-authenticated backup of retained objects, membership state and keys; recover to a fresh node, or explicitly complete a journaled membership update interrupted between writes.
+- **Local diagnostics.** Explain identity, selected and competing versions, pending work and ciphertext integrity through `status` and `doctor`, with suggested actions.
 
 Arc currently uses deliberate CLI operations. Automatic folder watching, background synchronization and peer discovery are outside this implementation.
 
@@ -95,16 +96,18 @@ Recovery recreates the backed-up device identity; use enrollment to add an indep
 
 Revocation takes effect as devices receive the new policy. It cannot erase plaintext or keys a former member already holds. Granting a content key can also expose historical ciphertext encrypted with that key; access is currently collection-wide.
 
-Journal repair covers newly prepared membership transitions. Legacy incomplete markers and signed-policy forks remain blocked for investigation. Backups are bounded and buffered in memory; missing historical keys or objects cannot be recreated.
+Journal repair covers newly prepared membership transitions. Legacy incomplete markers and signed-policy forks remain blocked for investigation. New complete backups stream authenticated records with a 16 GiB encoded limit; missing historical keys or objects cannot be recreated. Older recovery formats remain readable.
 
 Physical two-device and Bluetooth validation remain pending. The [hardware runbook](docs/reliability-and-carriers.md#two-device-acceptance-runbook) separates those checks from local process, pseudoterminal and simulator verification. Stable formats, independent security review and power-loss qualification also remain open.
+
+The [readiness guide](docs/release-readiness.md) covers diagnostics, streaming backup framing, an executable SSH-based two-host acceptance workflow, parser mutation checks and local experimental packaging. The [benchmark guide](docs/benchmarks.md) measures capture, storage reuse and recovery with disposable data.
 
 ## Development and verification
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --all-targets --locked -- -D warnings
+CARGO_PROFILE_TEST_OPT_LEVEL=2 cargo test --all-targets --locked
 ```
 
 The [earlier verification record](docs/device-and-sync-profile.md#verification-and-remaining-limits) covers the original 35-test implementation and 27-operation CLI exercise. For the recovery/resumption sprint, run `python3 tools/sprint_demo.py` after building; its disposable local workflow is described in the [reliability guide](docs/reliability-and-carriers.md). A successful local run does not qualify physical carriers.
@@ -117,6 +120,8 @@ The implementation profiles describe current behavior. The architecture document
 - [Base implementation](docs/experimental-profile.md): storage format, capture, verification, transfer and single-device recovery.
 - [Device and sync implementation](docs/device-and-sync-profile.md): membership, keys, history, merges and live exchange.
 - [Recovery and carriers](docs/reliability-and-carriers.md): complete backups, journal repair, persistent fragments and the two-device hardware runbook.
+- [Release readiness](docs/release-readiness.md): diagnostics, streaming recovery, executable acceptance, hardening and local packaging.
+- [Benchmarks](docs/benchmarks.md): reproducible storage and memory measurements.
 - [Data and synchronization](docs/data-and-sync.md): objects, versions, conflicts and transfer design.
 - [Security and keys](docs/security.md): threat model, authorization, recovery and metadata limits.
 - [Operations and validation](docs/operations-and-validation.md): durability, safe restore and acceptance scenarios.
