@@ -17,6 +17,7 @@ use crate::format::{
 use crate::store::Store;
 
 const MAX_HISTORY: usize = 4096;
+const MAX_OBJECT_SCAN: usize = 16_384;
 const MAX_TOTAL_BYTES: u64 = MAX_CHUNKS as u64 * CHUNK_SIZE as u64;
 
 /// Exact, scoped observations. `materialized` requires a key and complete plaintext validation.
@@ -36,7 +37,7 @@ fn random_id() -> Id {
     value
 }
 
-fn pinned(store: &Store) -> Result<(Id, Genesis)> {
+pub(crate) fn pinned(store: &Store) -> Result<(Id, Genesis)> {
     let raw = store.read_control("genesis")?;
     let genesis_id: Id = raw
         .try_into()
@@ -47,12 +48,31 @@ fn pinned(store: &Store) -> Result<(Id, Genesis)> {
     Ok((genesis_id, genesis))
 }
 
-fn secrets(store: &Store, password: &str, genesis: &Genesis) -> Result<Secrets> {
+pub(crate) fn secrets(store: &Store, password: &str, genesis: &Genesis) -> Result<Secrets> {
+    match fs::symlink_metadata(store.path().join("control/membership-pending")) {
+        Ok(_) => bail!("membership or key rotation transition is pending"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let keys = Secrets::unlock(&genesis.collection, &store.read_control("keys")?, password)?;
-    ensure!(
-        keys.root() == genesis.root,
-        "key material does not match pinned root"
-    );
+    match load_policy(store, genesis)? {
+        Some(policy) => ensure!(
+            policy.collection == genesis.collection
+                && policy.members.iter().any(|member| {
+                    member.key == keys.root()
+                        && !member.revoked
+                        && matches!(
+                            member.role,
+                            crate::policy::Role::Reader | crate::policy::Role::Writer
+                        )
+                }),
+            "device is not an active collection member"
+        ),
+        None => ensure!(
+            keys.root() == genesis.root,
+            "key material does not match pinned root"
+        ),
+    }
     Ok(keys)
 }
 
@@ -69,29 +89,159 @@ pub fn init(path: &Path, password: &str) -> Result<Id> {
     store.write_new_control("genesis", &genesis_id)?;
     Ok(genesis_id)
 }
+fn find_attestation(
+    store: &Store,
+    policy: &crate::policy::Policy,
+    snapshot: &Snapshot,
+    id: &Id,
+) -> Result<Id> {
+    let mut scanned = 0usize;
+    for item in fs::read_dir(store.path().join("objects"))? {
+        scanned += 1;
+        ensure!(
+            scanned <= MAX_OBJECT_SCAN,
+            "attestation scan limit exceeded"
+        );
+        let item = item?;
+        let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.len() != 64 {
+            continue;
+        }
+        let Ok(object_id) = format::parse_id(&name) else {
+            continue;
+        };
+        let Ok(raw) = store.get(&object_id) else {
+            continue;
+        };
+        let Ok(attestation) = crate::policy::Attestation::decode(&raw) else {
+            continue;
+        };
+        if attestation.snapshot == *id
+            && policy
+                .authorize_attested_snapshot(snapshot, id, &attestation)
+                .is_ok()
+        {
+            return Ok(object_id);
+        }
+    }
+    bail!("snapshot is outside the accepted policy frontier and has no valid writer attestation")
+}
 
-fn snapshot(store: &Store, id: &Id, genesis_id: &Id, genesis: &Genesis) -> Result<Snapshot> {
+pub(crate) fn load_policy(
+    store: &Store,
+    genesis: &Genesis,
+) -> Result<Option<crate::policy::Policy>> {
+    let path = store.path().join("control/policy");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(metadata.is_file(), "invalid policy pin");
+            crate::policy::Policy::load(store, &genesis.root)?
+                .context("policy pin could not be read")
+                .map(Some)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+pub(crate) type AttestationIndex = BTreeMap<(Id, [u8; 32]), (Id, crate::policy::Attestation)>;
+
+pub(crate) fn attestation_index(
+    store: &Store,
+    policy: &crate::policy::Policy,
+) -> Result<AttestationIndex> {
+    let mut index = BTreeMap::new();
+    let mut scanned = 0usize;
+    for item in fs::read_dir(store.path().join("objects"))? {
+        scanned += 1;
+        ensure!(
+            scanned <= MAX_OBJECT_SCAN,
+            "attestation scan limit exceeded"
+        );
+        let item = item?;
+        let path = item.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.len() > 256 {
+            continue;
+        }
+        let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(object_id) = format::parse_id(&name) else {
+            continue;
+        };
+        let Ok(raw) = store.get(&object_id) else {
+            continue;
+        };
+        let Ok(attestation) = crate::policy::Attestation::decode(&raw) else {
+            continue;
+        };
+        if attestation.verify(policy).is_ok() {
+            index
+                .entry((attestation.snapshot, attestation.writer))
+                .or_insert((object_id, attestation));
+        }
+    }
+    Ok(index)
+}
+
+fn snapshot_with_index(
+    store: &Store,
+    id: &Id,
+    genesis_id: &Id,
+    genesis: &Genesis,
+    policy: Option<&crate::policy::Policy>,
+    attestations: &AttestationIndex,
+) -> Result<Snapshot> {
     let Record::Snapshot(record) = format::inspect(&store.get(id)?)? else {
         bail!("expected a snapshot record");
     };
+    let attestation = attestations.get(&(*id, record.writer)).map(|(_, a)| a);
+    authorize_descriptor(&record, id, genesis_id, genesis, policy, attestation)?;
+    Ok(record)
+}
+
+pub(crate) fn authorize_descriptor(
+    record: &Snapshot,
+    id: &Id,
+    genesis_id: &Id,
+    genesis: &Genesis,
+    policy: Option<&crate::policy::Policy>,
+    attestation: Option<&crate::policy::Attestation>,
+) -> Result<()> {
     ensure!(
         record.collection == genesis.collection && record.genesis == *genesis_id,
         "snapshot belongs to a different collection"
     );
-    ensure!(
-        record.writer == genesis.root,
-        "snapshot signer is not the pinned root"
-    );
-    Ok(record)
+    match policy {
+        Some(policy) if policy.authorize_snapshot_id(record, id).is_ok() => Ok(()),
+        Some(policy) => policy.authorize_attested_snapshot(
+            record,
+            id,
+            attestation.context("snapshot outside accepted policy frontier")?,
+        ),
+        None => {
+            ensure!(
+                record.writer == genesis.root,
+                "snapshot signer is not the pinned root"
+            );
+            Ok(())
+        }
+    }
 }
 
-/// Verifies ancestry descriptors without requiring historical payload retention.
-fn ancestry(
+pub(crate) fn ancestry(
     store: &Store,
     root: &Id,
     genesis_id: &Id,
     genesis: &Genesis,
 ) -> Result<BTreeMap<Id, Snapshot>> {
+    let policy = load_policy(store, genesis)?;
+    let attestations = match &policy {
+        Some(policy) => attestation_index(store, policy)?,
+        None => BTreeMap::new(),
+    };
     let mut visited = BTreeMap::new();
     let mut active = BTreeSet::new();
     let mut stack = vec![(*root, false)];
@@ -108,7 +258,14 @@ fn ancestry(
             visited.len() < MAX_HISTORY,
             "snapshot history limit exceeded"
         );
-        let record = snapshot(store, &id, genesis_id, genesis)?;
+        let record = snapshot_with_index(
+            store,
+            &id,
+            genesis_id,
+            genesis,
+            policy.as_ref(),
+            &attestations,
+        )?;
         active.insert(id);
         stack.push((id, true));
         for parent in record.parents.iter().rev() {
@@ -204,6 +361,48 @@ fn entries_for(store: &Store, record: &Snapshot, keys: &Secrets) -> Result<Vec<E
     );
     Ok(entries)
 }
+fn entries_with_epoch_keys(
+    store: &Store,
+    genesis: &Genesis,
+    record: &Snapshot,
+    active: &Secrets,
+    password: &str,
+) -> Result<(Option<Secrets>, Vec<Entry>)> {
+    if let Ok(entries) = entries_for(store, record, active) {
+        return Ok((None, entries));
+    }
+    let Some(mut policy) = load_policy(store, genesis)? else {
+        bail!("snapshot cannot be opened with the collection key");
+    };
+    let active_policy_id = policy.id()?;
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_HISTORY {
+        ensure!(seen.insert(policy.id()?), "policy chain cycle");
+        let Some(previous) = policy.previous else {
+            break;
+        };
+        let raw = store.get(&previous)?;
+        ensure!(
+            format::id(&raw) == previous,
+            "policy history digest mismatch"
+        );
+        let parent = crate::policy::Policy::decode(&raw)?;
+        parent.verify(&genesis.root)?;
+        ensure!(
+            parent.collection == genesis.collection
+                && parent.epoch.checked_add(1) == Some(policy.epoch),
+            "invalid policy history link"
+        );
+        if previous != active_policy_id
+            && let Ok(keys) = crate::devices::secrets_for_policy(store, previous, password)
+            && let Ok(entries) = entries_for(store, record, &keys)
+        {
+            return Ok((Some(keys), entries));
+        }
+        policy = parent;
+    }
+    bail!("no retained epoch key can decrypt this snapshot")
+}
 
 pub fn verify(path: &Path, selected: &Id, password: Option<&str>) -> Result<Verification> {
     let store = Store::open(path)?;
@@ -212,8 +411,8 @@ pub fn verify(path: &Path, selected: &Id, password: Option<&str>) -> Result<Veri
     let record = graph.get(selected).context("missing selected snapshot")?;
     let bytes = inspect_closure(&store, record)?;
     if let Some(password) = password {
-        let keys = secrets(&store, password, &genesis)?;
-        entries_for(&store, record, &keys)?;
+        let active = secrets(&store, password, &genesis)?;
+        entries_with_epoch_keys(&store, &genesis, record, &active, password)?;
     }
     Ok(Verification {
         snapshot: *selected,
@@ -225,12 +424,24 @@ pub fn verify(path: &Path, selected: &Id, password: Option<&str>) -> Result<Veri
     })
 }
 
+pub(crate) fn entries_for_id(path: &Path, selected: &Id, password: &str) -> Result<Vec<Entry>> {
+    let store = Store::open(path)?;
+    let (genesis_id, genesis) = pinned(&store)?;
+    let graph = ancestry(&store, selected, &genesis_id, &genesis)?;
+    let record = graph.get(selected).context("missing selected snapshot")?;
+    let active = secrets(&store, password, &genesis)?;
+    inspect_closure(&store, record)?;
+    let (_, entries) = entries_with_epoch_keys(&store, &genesis, record, &active, password)?;
+    Ok(entries)
+}
+
 struct Capture<'a> {
     store: &'a Store,
     keys: &'a Secrets,
+    reuse_keys: &'a Secrets,
     collection: &'a Id,
     entries: Vec<Entry>,
-    previous: BTreeMap<String, Id>,
+    previous: BTreeMap<String, Entry>,
     objects: BTreeSet<Id>,
     chunks: usize,
     bytes: u64,
@@ -283,7 +494,10 @@ impl Capture<'_> {
             let child_name = path.rsplit('/').next().context("missing source name")?;
             let child = fd_path.join(child_name);
             let metadata = fs::symlink_metadata(&child)?;
-            let entry_id = self.previous.get(&path).copied().unwrap_or_else(random_id);
+            let previous_entry = self.previous.get(&path);
+            let entry_id = previous_entry
+                .map(|entry| entry.entry_id)
+                .unwrap_or_else(random_id);
             if metadata.is_dir() {
                 self.entries.push(Entry {
                     entry_id,
@@ -342,8 +556,30 @@ impl Capture<'_> {
                     );
                     hash.update(&buffer[..used]);
                     size += used as u64;
-                    let encrypted = self.keys.seal(self.collection, 1, &buffer[..used])?;
-                    let id = self.store.put(&encrypted)?;
+                    let reused_id = if self.keys.epoch_key() == self.reuse_keys.epoch_key() {
+                        previous_entry
+                            .and_then(|entry| entry.chunks.get(chunks.len()))
+                            .copied()
+                    } else {
+                        None
+                    };
+                    let id = if let Some(id) = reused_id {
+                        let raw = self.store.get(&id)?;
+                        let plain =
+                            Zeroizing::new(self.reuse_keys.open(self.collection, 1, &raw)?);
+                        if plain.as_slice() == &buffer[..used] {
+                            id
+                        } else {
+                            self.store.put(&self.keys.seal(
+                                self.collection,
+                                1,
+                                &buffer[..used],
+                            )?)?
+                        }
+                    } else {
+                        self.store
+                            .put(&self.keys.seal(self.collection, 1, &buffer[..used])?)?
+                    };
                     chunks.push(id);
                     self.objects.insert(id);
                     if used < CHUNK_SIZE {
@@ -390,6 +626,31 @@ fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
 }
 
 pub fn capture(path: &Path, source: &Path, password: &str) -> Result<Id> {
+    capture_impl(path, source, password, None, None)
+}
+
+pub fn merge_capture(path: &Path, source: &Path, parents: &[Id], password: &str) -> Result<Id> {
+    ensure!(
+        parents.len() >= 2,
+        "explicit merge requires at least two parents"
+    );
+    let mut unique = parents.to_vec();
+    unique.sort();
+    unique.dedup();
+    ensure!(
+        unique.len() >= 2,
+        "explicit merge requires two distinct parents"
+    );
+    capture_impl(path, source, password, Some(parents[0]), Some(unique))
+}
+
+fn capture_impl(
+    path: &Path,
+    source: &Path,
+    password: &str,
+    base: Option<Id>,
+    merge_parents: Option<Vec<Id>>,
+) -> Result<Id> {
     let store = Store::open(path)?;
     let writer_lock = OpenOptions::new()
         .read(true)
@@ -407,6 +668,12 @@ pub fn capture(path: &Path, source: &Path, password: &str) -> Result<Id> {
         .context("another local writer is active")?;
     let (genesis_id, genesis) = pinned(&store)?;
     let keys = secrets(&store, password, &genesis)?;
+    if let Some(policy) = load_policy(&store, &genesis)? {
+        ensure!(
+            policy.allows_writer(&keys.root()),
+            "device is not an active writer in policy"
+        );
+    }
     ensure!(
         !fs::symlink_metadata(source)?.file_type().is_symlink(),
         "source may not be a symlink"
@@ -426,18 +693,34 @@ pub fn capture(path: &Path, source: &Path, password: &str) -> Result<Id> {
     )
     .context("cannot safely anchor capture root (Linux openat2 required)")?;
     let head = store.head()?;
+    let selected_base = base.or(head);
+    let mut parents = merge_parents.unwrap_or_else(|| selected_base.into_iter().collect());
+    parents.sort();
+    parents.dedup();
+    ensure!(parents.len() <= 64, "snapshot parent limit exceeded");
     let mut previous = BTreeMap::new();
-    if let Some(head) = head {
-        let graph = ancestry(&store, &head, &genesis_id, &genesis)?;
-        let parent = graph.get(&head).context("missing base snapshot")?;
+    let mut baseline_keys = None;
+    if let Some(base_id) = selected_base {
+        let graph = ancestry(&store, &base_id, &genesis_id, &genesis)?;
+        let parent = graph
+            .get(&base_id)
+            .context("missing selected base snapshot")?;
         inspect_closure(&store, parent)?;
-        previous = entries_for(&store, parent, &keys)?
+        let (old_keys, entries) =
+            entries_with_epoch_keys(&store, &genesis, parent, &keys, password)?;
+        baseline_keys = old_keys;
+        previous = entries
             .into_iter()
-            .map(|e| (e.path, e.entry_id))
+            .map(|entry| (entry.path.clone(), entry))
             .collect();
     }
+    for parent in &parents {
+        ancestry(&store, parent, &genesis_id, &genesis)?;
+    }
+    let reuse_keys = baseline_keys.as_ref().unwrap_or(&keys);
     let mut state = Capture {
         store: &store,
+        reuse_keys,
         keys: &keys,
         collection: &genesis.collection,
         entries: Vec::new(),
@@ -463,7 +746,7 @@ pub fn capture(path: &Path, source: &Path, password: &str) -> Result<Id> {
         collection: genesis.collection,
         genesis: genesis_id,
         writer: keys.root(),
-        parents: head.into_iter().collect(),
+        parents,
         manifest,
         objects: state.objects.into_iter().collect(),
     };
@@ -472,6 +755,16 @@ pub fn capture(path: &Path, source: &Path, password: &str) -> Result<Id> {
     let id = store.put(&bytes)?;
     inspect_closure(&store, &snapshot)?;
     entries_for(&store, &snapshot, &keys)?;
+    if let Some(policy) = load_policy(&store, &genesis)? {
+        ensure!(
+            policy.allows_writer(&keys.root()),
+            "device is not an active writer in policy"
+        );
+        let signing_seed = Zeroizing::new(keys.signing_seed());
+        let signer = crate::crypto::DeviceSecrets::from_seed(*signing_seed);
+        let attestation = policy.attest(id, &signer)?;
+        store.put(&attestation.encode()?)?;
+    }
     ensure!(
         store.head()? == head,
         "local head changed during capture; snapshot retained, head not updated"
@@ -490,11 +783,13 @@ impl Drop for Staging {
 pub fn restore(path: &Path, selected: &Id, destination: &Path, password: &str) -> Result<()> {
     let store = Store::open(path)?;
     let (genesis_id, genesis) = pinned(&store)?;
-    let keys = secrets(&store, password, &genesis)?;
+    let active_keys = secrets(&store, password, &genesis)?;
     let graph = ancestry(&store, selected, &genesis_id, &genesis)?;
     let record = graph.get(selected).context("missing selected snapshot")?;
     inspect_closure(&store, record)?;
-    let entries = entries_for(&store, record, &keys)?;
+    let (old_keys, entries) =
+        entries_with_epoch_keys(&store, &genesis, record, &active_keys, password)?;
+    let keys = old_keys.as_ref().unwrap_or(&active_keys);
     ensure!(
         destination.file_name().is_some(),
         "restore destination must name a new directory"
@@ -555,6 +850,50 @@ pub fn restore(path: &Path, selected: &Id, destination: &Path, password: &str) -
     Ok(())
 }
 
+fn add_policy_bundle_objects(
+    store: &Store,
+    genesis: &Genesis,
+    graph: &BTreeMap<Id, Snapshot>,
+    ids: &mut BTreeSet<Id>,
+) -> Result<()> {
+    let Some(mut policy) = load_policy(store, genesis)? else {
+        return Ok(());
+    };
+    for (id, snapshot) in graph {
+        if policy.authorize_snapshot_id(snapshot, id).is_err() {
+            ids.insert(find_attestation(store, &policy, snapshot, id)?);
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_HISTORY {
+        let id = policy.id()?;
+        ensure!(seen.insert(id), "policy chain cycle");
+        let bytes = store.get(&id)?;
+        ensure!(format::id(&bytes) == id, "policy digest mismatch");
+        ids.insert(id);
+        let Some(previous) = policy.previous else {
+            ensure!(
+                policy.epoch == 0,
+                "policy chain does not start at epoch zero"
+            );
+            return Ok(());
+        };
+        let raw = store.get(&previous)?;
+        ensure!(
+            format::id(&raw) == previous,
+            "previous policy digest mismatch"
+        );
+        let parent = crate::policy::Policy::decode(&raw)?;
+        parent.verify(&genesis.root)?;
+        ensure!(
+            parent.collection == genesis.collection
+                && parent.epoch.checked_add(1) == Some(policy.epoch),
+            "invalid policy chain link"
+        );
+        policy = parent;
+    }
+    bail!("policy chain exceeds history limit")
+}
 /// Exports pinned genesis, ancestry descriptors, and the selected snapshot's ciphertext closure.
 pub fn export(path: &Path, selected: &Id, destination: &Path) -> Result<()> {
     let store = Store::open(path)?;
@@ -563,6 +902,7 @@ pub fn export(path: &Path, selected: &Id, destination: &Path) -> Result<()> {
     let record = graph.get(selected).context("missing selected snapshot")?;
     inspect_closure(&store, record)?;
     let mut ids: BTreeSet<Id> = graph.keys().copied().collect();
+    add_policy_bundle_objects(&store, &genesis, &graph, &mut ids)?;
     ids.insert(genesis_id);
     ids.extend(record.objects.iter().copied());
     crate::bundle::export(&store, &ids.into_iter().collect::<Vec<_>>(), destination)
@@ -578,7 +918,11 @@ pub fn import(path: &Path, source: &Path) -> Result<usize> {
 /// Recovery carries no data: identity pin + existing encrypted key blob, independently authenticated.
 pub fn export_recovery(path: &Path, destination: &Path) -> Result<()> {
     let store = Store::open(path)?;
-    let (genesis_id, _) = pinned(&store)?;
+    let (genesis_id, genesis) = pinned(&store)?;
+    ensure!(
+        load_policy(&store, &genesis)?.is_none(),
+        "recovery kits for policy-managed collections are not supported"
+    );
     let genesis_bytes = store.get(&genesis_id)?;
     let keys = store.read_control("keys")?;
     let parent = destination

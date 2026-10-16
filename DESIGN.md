@@ -1,6 +1,6 @@
 # Arc design review draft
 
-Status: architecture review draft, revision 0.2, 2026-10-16. The user subsequently instructed “let's begin implementation.” A bounded Rust prototype now implements [arc-exp-1](docs/experimental-profile.md). This architecture remains the broader target; the prototype's documented subset is not a frozen interoperable v1 protocol or a security assurance. Production/stable-profile review gates remain open in [the decision register](docs/decisions-and-sources.md).
+Status: architecture review draft, revision 0.3, 2026-10-16. Following the first implementation, the user authorized all five next milestones: history/selection, ciphertext reuse, device membership, explicit conflict resolution and live exchange. The [base profile](docs/experimental-profile.md) and [device/sync extension](docs/device-and-sync-profile.md) describe the experimental implementation. This architecture remains the broader target; no stable protocol or production-security assurance is established. Review gates remain in [the decision register](docs/decisions-and-sources.md).
 
 ## 1. Purpose and requirements
 
@@ -8,7 +8,7 @@ Arc is decentralized encrypted storage with verifiable synchronization independe
 
 The user-established requirements are secure decentralized data storage, source/transport independence, verifiable exchange between nodes, a ground-up redesign, and a full design before implementation. The preserved prototype's thesis is relevant; its security, anonymity, recovery and scale claims are not inherited. Luma is an independent possible consumer, not a core dependency or a reason to narrow Arc into a research archive. No AI model is part of authorization, encryption or verification.
 
-The choices below supply the working direction for the user-authorized implementation. The current experiment adopts private collections, Rust, encrypted signed snapshots and a CLI; broader membership, epoch, multi-writer and network behavior remains future work rather than an implemented or individually reviewed guarantee. See the experimental profile for deviations from the proposed final architecture.
+The choices below supply the working direction for the authorized implementation. The experiment now covers private collections, history and same-key ciphertext reuse, independently enrolled readers/writers, signed policy/key changes, explicit multi-parent merges, foreground authenticated TCP exchange and constrained-contact simulation. The extension documents limitations including interrupted membership recovery, policy-aware recovery-kit export and real hardware adapters. A tested subset is not completion of every larger architectural requirement.
 
 ### Intended first user and scenario
 

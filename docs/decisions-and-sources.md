@@ -1,6 +1,6 @@
 # Decisions, evidence and implementation gates
 
-Part of the [Arc design review draft](../DESIGN.md), revision 0.2, 2026-10-16. User requirements, assistant recommendations, external source claims and demonstrated behavior are distinct. This register owns decision status; [arc-exp-1](experimental-profile.md) owns the implemented experimental subset.
+Part of the [Arc design review draft](../DESIGN.md), revision 0.3, 2026-10-16. User requirements, assistant recommendations, external source claims and demonstrated behavior are distinct. This register owns decision status; the [base profile](experimental-profile.md) and [device/sync extension](device-and-sync-profile.md) own the implemented experimental behavior.
 
 ## 1. Established direction
 
@@ -11,6 +11,8 @@ The prototype is preserved at commit `5f529a07af44b4fba02715aa0fa5a37eab06a11d` 
 The redesign baseline `b00047a` proposed a local preservation tool with prominent Luma integration. This draft supersedes that framing: distributed storage and exchange are part of the core architecture, and integrations are optional downstream consumers. The original prototype and its history remain unchanged.
 
 After reviewing the architecture delivery, the user instructed “let's begin implementation.” This authorizes implementation using the draft as a working direction. The initial experiment deliberately narrows it to single-root encrypted snapshots, local storage, offline bundles and scoped key/data recovery. It does not establish that the user individually selected every future policy/crypto detail or that qualified review occurred.
+
+The user then requested continuing and trying to achieve all five next milestones. The implementation now covers history/diff/selection, same-key encrypted chunk reuse, independent device enrollment and policy/key changes, explicit branching/merging, and authenticated foreground TCP exchange plus constrained-contact simulation. The extension records exercised behavior, bounded review findings and remaining limitations; real hardware adapters and production security are not claimed.
 
 ## 2. Recommended choices for user review
 
@@ -31,7 +33,7 @@ These are the working architectural defaults for the authorized implementation, 
 | A11 | No automatic destructive retention, source-folder watching or network discovery initially | Preserves user intent while failure semantics are established | Automation can follow with explicit scoped policies |
 | A12 | No mandatory Luma, LLM, blockchain, paid service or provider account | Core remains useful independently | Consumers can integrate through the same local API later |
 
-The most consequential future decisions remain A1–A3 (who trusts whom), A4–A6 (offline work and membership changes), and A9–A10 (demonstrable scope). Implementation permission comes from the user's subsequent explicit instruction, not from this table. The experiment validates a subset before wider authority/network features.
+The architectural defaults guide the user-authorized experiment. History, reuse, device policy, explicit conflicts and foreground transfer now have implementations, while the larger stable protocol and operational recovery requirements remain open. The extension documents differences from the target, including explicit policy packages, whole-collection grants, manual interrupted-transition recovery and object-level transfer resumption.
 
 ## 3. Stable-profile and security gates
 

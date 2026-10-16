@@ -2,6 +2,8 @@
 
 Status: experimental implementation initiated after the user's 2026-10-16 instruction to begin implementation. This page owns the implemented subset and exact experimental encodings. The broader [architecture](../DESIGN.md) remains the target; its unimplemented features and review gates are not claimed complete. `arc-exp-1` is not a frozen, interoperable v1 protocol, a security-audited product or a safe sole backup for valuable data. Format changes may require explicit export/migration or disposal of experimental collections.
 
+The user subsequently authorized all five next milestones. This page preserves the original base format and its original verification record. Current history/reuse, membership/key lifecycle, merging, authenticated live transfer and constrained-contact behavior is specified in [the extension profile](device-and-sync-profile.md). Statements below about the original single-device slice are historical scope, not the complete current feature list.
+
 ## Implemented scope
 
 A Linux Rust library and foreground CLI create a single-root collection, capture regular files/directories into encrypted chunks and an encrypted manifest, sign snapshots, verify scoped closure and ancestry, restore into a new destination, and transfer immutable objects through an offline file bundle. A separate encrypted recovery kit contains the existing root/data secrets but no source data. Import does not enroll another identity, select a head, overwrite working files or execute received content.
@@ -79,7 +81,7 @@ Recovery kit framing is `ASCII("ARCKEY1") || LF || genesis_id32 || genesis_recor
 
 These bounds are intentional pilot restrictions and differ from the larger architecture's proposed maxima. A path can hit the manifest-size cap before reaching the entry cap. An object transfer container accepts opaque bounded bytes; accepted current snapshot semantics always require application verification against the pinned identity. No unlimited recursion or unbounded byte allocation is intended.
 
-Next implementation work is explicit head/conflict selection, shared-ciphertext reuse, peer/device admission and reviewed epochs, authenticated live reconciliation, resume/fragment scheduling and qualified stable-profile security review. Real hardware/carrier integrations and independent recovery/retention validation remain separate milestones.
+The next milestones listed at the original base handoff were history/selection, ciphertext reuse, device membership, merges and live transfer. These are now addressed by the experimental [device/sync extension](device-and-sync-profile.md). Stable protocol review, full power-loss recovery, multi-epoch catch-up improvements and real carrier qualification remain separate work.
 
 ## Verification of this implementation
 

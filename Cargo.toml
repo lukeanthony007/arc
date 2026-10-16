@@ -22,11 +22,15 @@ chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 hex = "0.4"
+hpke = { version = "0.13", features = ["x25519", "std"] }
 minicbor = { version = "0.26", features = ["std"] }
 rand = "0.8"
+rand_core = { version = "0.9", features = ["os_rng"] }
 rpassword = "7.4"
 rustix = { version = "1.1", features = ["fs"] }
 sha2 = "0.10"
+snow = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]

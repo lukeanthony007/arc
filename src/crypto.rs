@@ -41,6 +41,23 @@ impl Secrets {
             .verifying_key()
             .to_bytes()
     }
+    /// Construct member keys without granting genesis authority.
+    pub fn from_member(signing_seed: [u8; 32], epoch_key: [u8; 32]) -> Self {
+        Self {
+            root_seed: signing_seed,
+            epoch_key,
+        }
+    }
+    pub fn epoch_key(&self) -> [u8; 32] {
+        self.epoch_key
+    }
+    pub fn replace_epoch_key(&mut self, key: [u8; 32]) {
+        self.epoch_key.zeroize();
+        self.epoch_key = key;
+    }
+    pub(crate) fn signing_seed(&self) -> [u8; 32] {
+        self.root_seed
+    }
     pub fn seal(&self, collection: &Id, kind: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
         ensure!(
             (kind == 1 || kind == 2) && plaintext.len() <= MAX_OBJECT,
@@ -132,6 +149,11 @@ impl Secrets {
             .sign(&msg)
             .to_bytes();
         format::encode_snapshot(snapshot, &sig)
+    }
+    pub(crate) fn sign_authority(&self, message: &[u8]) -> [u8; 64] {
+        SigningKey::from_bytes(&self.root_seed)
+            .sign(message)
+            .to_bytes()
     }
     pub fn lock(&self, collection: &Id, password: &str) -> Result<Vec<u8>> {
         ensure!(
@@ -236,6 +258,139 @@ impl Secrets {
         Ok(Self {
             root_seed,
             epoch_key,
+        })
+    }
+}
+/// Independently provisioned device signing identity; it contains no collection authority or data key.
+pub struct DeviceSecrets {
+    seed: [u8; 32],
+    envelope_seed: [u8; 32],
+}
+impl Drop for DeviceSecrets {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+        self.envelope_seed.zeroize();
+    }
+}
+impl DeviceSecrets {
+    pub fn generate() -> Self {
+        let mut seed = [0u8; 32];
+        let mut envelope_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        OsRng.fill_bytes(&mut envelope_seed);
+        Self {
+            seed,
+            envelope_seed,
+        }
+    }
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let mut envelope_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut envelope_seed);
+        Self {
+            seed,
+            envelope_seed,
+        }
+    }
+    pub fn public(&self) -> [u8; 32] {
+        SigningKey::from_bytes(&self.seed)
+            .verifying_key()
+            .to_bytes()
+    }
+    pub fn encryption_public(&self) -> [u8; 32] {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        *PublicKey::from(&StaticSecret::from(self.envelope_seed)).as_bytes()
+    }
+    pub(crate) fn envelope_seed(&self) -> [u8; 32] {
+        self.envelope_seed
+    }
+    pub(crate) fn signing_seed(&self) -> [u8; 32] {
+        self.seed
+    }
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        SigningKey::from_bytes(&self.seed).sign(message).to_bytes()
+    }
+    pub fn sign_snapshot(&self, snapshot: &Snapshot) -> Result<Vec<u8>> {
+        ensure!(
+            snapshot.writer == self.public(),
+            "snapshot writer does not match device"
+        );
+        let message = snapshot_signing_bytes(snapshot)?;
+        format::encode_snapshot(snapshot, &self.sign(&message))
+    }
+    /// Store both independent private keys under password-based authenticated encryption.
+    pub fn lock(&self, password: &str) -> Result<Vec<u8>> {
+        ensure!(
+            !password.is_empty() && password.len() <= 4096,
+            "invalid password length"
+        );
+        let mut salt = [0u8; 16];
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut nonce);
+        let params = Params::new(65536, 3, 1, Some(32))?;
+        let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut key = Zeroizing::new([0u8; 32]);
+        a.hash_password_into(password.as_bytes(), &salt, &mut *key)?;
+        let cipher = XChaCha20Poly1305::new((&*key).into());
+        let mut material = Zeroizing::new([0u8; 64]);
+        material[..32].copy_from_slice(&self.seed);
+        material[32..].copy_from_slice(&self.envelope_seed);
+        let ct = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &*material,
+                    aad: b"arc-exp-1/device-key-v2\0",
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("device key encryption failed"))?;
+        let mut out = Vec::new();
+        Encoder::new(&mut out)
+            .array(4)?
+            .u8(2)?
+            .bytes(&salt)?
+            .bytes(&nonce)?
+            .bytes(&ct)?;
+        Ok(out)
+    }
+    pub fn unlock(bytes: &[u8], password: &str) -> Result<Self> {
+        ensure!(
+            !password.is_empty() && password.len() <= 4096 && bytes.len() <= 256,
+            "invalid device key input"
+        );
+        let mut d = Decoder::new(bytes);
+        ensure!(
+            d.array()? == Some(4) && d.u8()? == 2,
+            "unsupported device key format"
+        );
+        let salt: [u8; 16] = d.bytes()?.try_into()?;
+        let nonce: [u8; 24] = d.bytes()?.try_into()?;
+        let ct = d.bytes()?;
+        ensure!(d.position() == bytes.len(), "trailing device key bytes");
+        let params = Params::new(65536, 3, 1, Some(32))?;
+        let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut key = Zeroizing::new([0u8; 32]);
+        a.hash_password_into(password.as_bytes(), &salt, &mut *key)?;
+        let cipher = XChaCha20Poly1305::new((&*key).into());
+        let plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: ct,
+                        aad: b"arc-exp-1/device-key-v2\0",
+                    },
+                )
+                .map_err(|_| anyhow::anyhow!("device key authentication failed"))?,
+        );
+        ensure!(plain.len() == 64, "invalid device key plaintext");
+        let mut seed = [0u8; 32];
+        let mut envelope_seed = [0u8; 32];
+        seed.copy_from_slice(&plain[..32]);
+        envelope_seed.copy_from_slice(&plain[32..]);
+        Ok(Self {
+            seed,
+            envelope_seed,
         })
     }
 }

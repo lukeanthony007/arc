@@ -123,9 +123,32 @@ impl Store {
         let _ = fs::remove_file(tmp);
         result
     }
+    pub fn set_control(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        check_control_name(name)?;
+        if bytes.len() > MAX_OBJECT {
+            bail!("control exceeds maximum size");
+        }
+        let dir = self.path.join("control");
+        check_dir(&dir)?;
+        let temp = temporary(&dir, bytes)?;
+        let dest = dir.join(name);
+        let result = fs::rename(&temp, &dest)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| sync_dir(&dir));
+        let _ = fs::remove_file(temp);
+        result
+    }
     pub fn read_control(&self, name: &str) -> Result<Vec<u8>> {
         check_control_name(name)?;
         read_bounded(&self.path.join("control").join(name), MAX_OBJECT)
+    }
+    pub fn clear_membership_pending(&self) -> Result<()> {
+        let path = self.path.join("control/membership-pending");
+        match fs::remove_file(&path) {
+            Ok(()) => sync_dir(&self.path.join("control")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
     pub fn set_head(&self, id: &Id) -> Result<()> {
         let dir = self.path.join("control");
@@ -162,7 +185,10 @@ fn object_path(dir: &Path, id: &Id) -> PathBuf {
     dir.join(hex::encode(id))
 }
 fn check_control_name(n: &str) -> Result<()> {
-    if !matches!(n, "genesis" | "keys" | "head") {
+    if !matches!(
+        n,
+        "genesis" | "keys" | "keys-history" | "head" | "policy" | "membership-pending"
+    ) {
         bail!("invalid control name");
     }
     Ok(())
