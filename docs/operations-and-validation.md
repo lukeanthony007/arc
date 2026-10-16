@@ -1,6 +1,6 @@
 # Operations, interfaces and validation
 
-Part of the [Arc design review draft](../DESIGN.md). Commands, layouts, tests and phases below specify intended behavior; none exists as a new implementation or has been executed. Gates and dependencies are in [the decision register](decisions-and-sources.md).
+Part of the [Arc design review draft](../DESIGN.md). This page specifies target behavior and the full acceptance plan. Following the user's instruction to begin implementation, [arc-exp-1](experimental-profile.md) implements a narrower local/offline subset; only tests actually reported in the implementation handoff are completed. Full policy, crash, live-network and hardware scenarios below remain future work. Gates and dependencies are in [the decision register](decisions-and-sources.md).
 
 ## 1. Local persistence contract
 
@@ -96,7 +96,7 @@ Time is informational: local clocks support logs, retry scheduling and observati
 
 ## 6. Acceptance matrix
 
-These are required future tests, not completed results. Each scenario names a property that can falsify the design. Reuse deterministic fixtures and property tests where they test behavior, not implementation details. Cross-implementation format vectors are distinct from unit tests.
+These are the full target acceptance scenarios. A subset has executable coverage in arc-exp-1, as documented in its profile and implementation handoff; the matrix is not a claim that all scenarios passed. Each names a property that can falsify the design. Cross-implementation format vectors and fault-injected durability tests remain distinct from ordinary unit/integration tests.
 
 | Scenario | Required observation | Requirement |
 | --- | --- | --- |
@@ -147,4 +147,4 @@ Review the proposed limits against large photo/video libraries before freezing t
 | I5 — real carriers | Individually approved Bluetooth, radio or SMS profile/integration | Actual device/provider tests, cost controls and platform limits documented per adapter |
 | Release review | Security assessment, fresh-device recovery, compatibility fixtures and reproducible demonstration | Claims limited to exercised behavior; unresolved release blockers visible |
 
-The architectural requirements for all carriers are designed now even though adapters arrive sequentially. This avoids reducing the core to a local archive and attempting to attach synchronization afterward. Every implementation phase remains unauthorized until D1 and the user's implementation approval; the table is not an instruction to start coding.
+The architectural requirements for all carriers are designed even though adapters arrive sequentially. The user's subsequent instruction to begin implementation authorizes the bounded experimental profile documented separately; it does not imply D1, production-security review, complete I1/I2 acceptance or any live/hardware adapter is finished. Retain these exits as the stable-profile and release targets rather than rewriting a working prototype into evidence of full satisfaction.

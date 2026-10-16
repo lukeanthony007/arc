@@ -1,6 +1,6 @@
 # Decisions, evidence and implementation gates
 
-Part of the [Arc design review draft](../DESIGN.md), revision 0.1, 2026-10-16. User requirements, assistant recommendations, external source claims and demonstrated behavior are distinct. This register is the authoritative status of the design choices below; a proposal appearing in another document does not make it approved.
+Part of the [Arc design review draft](../DESIGN.md), revision 0.2, 2026-10-16. User requirements, assistant recommendations, external source claims and demonstrated behavior are distinct. This register owns decision status; [arc-exp-1](experimental-profile.md) owns the implemented experimental subset.
 
 ## 1. Established direction
 
@@ -10,9 +10,11 @@ The prototype is preserved at commit `5f529a07af44b4fba02715aa0fa5a37eab06a11d` 
 
 The redesign baseline `b00047a` proposed a local preservation tool with prominent Luma integration. This draft supersedes that framing: distributed storage and exchange are part of the core architecture, and integrations are optional downstream consumers. The original prototype and its history remain unchanged.
 
+After reviewing the architecture delivery, the user instructed “let's begin implementation.” This authorizes implementation using the draft as a working direction. The initial experiment deliberately narrows it to single-root encrypted snapshots, local storage, offline bundles and scoped key/data recovery. It does not establish that the user individually selected every future policy/crypto detail or that qualified review occurred.
+
 ## 2. Recommended choices for user review
 
-All rows are **proposed, not adopted**. The rationale describes why the draft uses them; alternatives remain available until approval.
+These are the working architectural defaults for the authorized implementation, with alternatives retained for future review. The exact implemented subset/deviations are in the experimental profile; unimplemented rows are not completed capabilities or individually verified security choices.
 
 | ID | Proposed decision | Reason and cost | Alternative considered |
 | --- | --- | --- | --- |
@@ -29,11 +31,11 @@ All rows are **proposed, not adopted**. The rationale describes why the draft us
 | A11 | No automatic destructive retention, source-folder watching or network discovery initially | Preserves user intent while failure semantics are established | Automation can follow with explicit scoped policies |
 | A12 | No mandatory Luma, LLM, blockchain, paid service or provider account | Core remains useful independently | Consumers can integrate through the same local API later |
 
-The most consequential user choices are A1–A3 (who trusts whom), A4–A6 (offline work and membership changes), and A9–A10 (first demonstrable scope). The rest can follow those decisions. No implementation permission is inferred from reviewing a table.
+The most consequential future decisions remain A1–A3 (who trusts whom), A4–A6 (offline work and membership changes), and A9–A10 (demonstrable scope). Implementation permission comes from the user's subsequent explicit instruction, not from this table. The experiment validates a subset before wider authority/network features.
 
-## 3. Pre-implementation gates
+## 3. Stable-profile and security gates
 
-A full architecture is present; a frozen implementable cryptographic protocol is not. These are concrete remaining design deliverables, not TODOs to discover while coding. They are currently **open**. Do not claim implementation readiness until each required gate has a reviewed artifact and the user has approved beginning implementation.
+A full architecture and experimental implementation are present; the full stable cryptographic protocol is not frozen. The user's implementation instruction supersedes the earlier blanket instruction to wait before coding. The gates below remain **open for the stable/full protocol**, and do not become satisfied merely because the narrower experiment compiles or passes local tests. The experimental profile records exact bootstrap encodings and limitations instead of claiming all gates closed.
 
 | Gate | Required artifact / decision | Exit evidence |
 | --- | --- | --- |
@@ -45,9 +47,9 @@ A full architecture is present; a frozen implementable cryptographic protocol is
 | C1 — cryptographic composition | Exact primitive suites and key separation, wrapping/signing contexts, nonce/subkey strategy, canonicalization, library/API and version assessment | Qualified independent cryptographic review of the actual profile; known limitations and required changes incorporated; this document review is not a substitute |
 | C2 — key custody | Linux key store/unlock behavior, password KDF parameters, recovery scope/staleness, root-loss/fork migration and device replacement | Reviewed user flows and threat/failure walkthroughs; no undocumented plaintext key fallback |
 | P1 — dependency/reuse | Bounded Willow/Reticulum/library evaluation against the agreed invariants, licenses, maintenance/security evidence and actual APIs | Explicit adopt/adapt/reject decisions with versioned evidence; no dependency chosen from marketing claims |
-| P2 — product approval | User accepts the intended first user, scope, permission/authority model, conflict/revocation costs and first supported environment | Explicit design and implementation approval after the remaining design artifacts are reviewable |
+| P2 — product approval | User accepts proceeding with the architecture as a working direction and authorizes implementation | Received 2026-10-16: “let's begin implementation”; implemented scope is documented in arc-exp-1; future detailed features remain reviewable |
 
-C1 requires a suitably qualified review; parallel design contributions in this session are not a security audit. Golden vectors and table-top scenarios before implementation are design evidence. Executable interoperability, fuzzing, performance, real hardware and crash testing belong to the later authorized implementation/release phases, not claims that can be made now.
+C1 requires a suitably qualified review; design contributions and implementation consistency reviews are not a security audit. Static vectors and table-top scenarios are design evidence; executable tests provide additional bounded evidence. The experimental profile and implementation handoff record actual results. Fuzzing, independent interoperability, performance, real hardware and power-loss qualification remain separate work and are not established by the prototype tests.
 
 Do not promise that a review eliminates all vulnerabilities. If review changes a premise or record format, update dependent semantics, vectors and recovery procedures before approval. A blocked dependency or unavailable qualified reviewer remains a visible blocker.
 
@@ -95,4 +97,4 @@ Prepared from the user clarification, the archived README at the pinned revision
 
 The two contributors then reviewed the integrated security, synchronization and relevant operational sections. Their concrete findings led to explicit migration preflight and emergency blocked states, safe handling of oversized frontiers, retraction of stale current-state summaries without altering restored files, separate GC dependency classes, finite index-shape proposals, an unsupported-until-specified SMS profile and a recovery-kit authority clarification. The integration owner checked those amendments. This is a bounded design-consistency review, not a cryptographic audit, proof of convergence or independent review of every final sentence.
 
-No new runtime code, service, network adapter, key material, sample financial data or production collection was created. No build, runtime behavior, cryptographic test, performance measurement or recovery drill has been performed. Documentation consistency and local links are checked separately during task completion. Repository publication status belongs in the task handoff; a pushed review branch is not a merged design or user approval.
+Historical design-only verification: no runtime code, service, network adapter, key material, sample financial data or production collection was created during the design phase. The user then authorized implementation. The new experiment adds runtime code and disposable-data tests as documented in the experimental profile and task handoff; no production collection, service activation, hardware validation or qualified cryptographic audit is established.

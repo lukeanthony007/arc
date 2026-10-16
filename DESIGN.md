@@ -1,6 +1,6 @@
 # Arc design review draft
 
-Status: proposed architecture, revision 0.1, 2026-10-16. This is a design deliverable, not implementation approval, a frozen interoperable protocol, or a security assurance. There is no new executable implementation. The implementation gate is closed until the decisions and specification work in [the decision register](docs/decisions-and-sources.md) are resolved and the user approves the design.
+Status: architecture review draft, revision 0.2, 2026-10-16. The user subsequently instructed “let's begin implementation.” A bounded Rust prototype now implements [arc-exp-1](docs/experimental-profile.md). This architecture remains the broader target; the prototype's documented subset is not a frozen interoperable v1 protocol or a security assurance. Production/stable-profile review gates remain open in [the decision register](docs/decisions-and-sources.md).
 
 ## 1. Purpose and requirements
 
@@ -8,7 +8,7 @@ Arc is decentralized encrypted storage with verifiable synchronization independe
 
 The user-established requirements are secure decentralized data storage, source/transport independence, verifiable exchange between nodes, a ground-up redesign, and a full design before implementation. The preserved prototype's thesis is relevant; its security, anonymity, recovery and scale claims are not inherited. Luma is an independent possible consumer, not a core dependency or a reason to narrow Arc into a research archive. No AI model is part of authorization, encryption or verification.
 
-The remaining choices in this document are recommendations for review. In particular, private collections, a single logical membership authority, snapshot-based history, Rust, the CLI-first experience and release sequencing are proposed defaults, not requirements the user has already approved.
+The choices below supply the working direction for the user-authorized implementation. The current experiment adopts private collections, Rust, encrypted signed snapshots and a CLI; broader membership, epoch, multi-writer and network behavior remains future work rather than an implemented or individually reviewed guarantee. See the experimental profile for deviations from the proposed final architecture.
 
 ### Intended first user and scenario
 
@@ -145,6 +145,6 @@ Recovery uses retained ciphertext plus the appropriate keys; either alone is ins
 - [Data, versions and exchange](docs/data-and-sync.md): record model, completeness, conflict/revocation interaction, reconciliation, packages, adapter contracts and finite limits.
 - [Security and key lifecycle](docs/security.md): adversaries, permissions, candidate cryptographic profile, enrollment, recovery, rotation and metadata disclosure.
 - [Operations and validation](docs/operations-and-validation.md): persistence, safe restore, retention, interfaces, acceptance scenarios and gated delivery plan.
-- [Decisions and research](docs/decisions-and-sources.md): recommended defaults, alternatives, source evidence and the concrete work still required before implementation approval.
+- [Decisions and research](docs/decisions-and-sources.md): working defaults, alternatives, source evidence and remaining stable-protocol/security review gates.
 
-This document set is the full architecture review draft. Wire schemas, exact cryptographic preimages and key-file formats, reviewed dependency versions, and independent cryptographic assessment are explicit pre-implementation gates. A design draft can be complete enough to review its architecture without being a frozen security protocol. Do not begin implementation merely because a phase or command appears here.
+This document set defines the broader architecture; [the experimental profile](docs/experimental-profile.md) defines what the implementation actually supports. The user's subsequent implementation instruction authorizes developing that bounded prototype. Exact stable-version schemas, key custody, interoperable network behavior, dependency assessment and qualified independent cryptographic review remain requirements before treating it as a stable or production security protocol. Do not infer those gates passed from a successful prototype test.

@@ -1,6 +1,6 @@
 # Security, authority and key lifecycle
 
-Part of the [Arc design review draft](../DESIGN.md). This is a threat model and candidate security design, not an audit, proof or claim of production readiness. The cryptographic and recovery gates in [the decision register](decisions-and-sources.md) remain closed.
+Part of the [Arc design review draft](../DESIGN.md). This is the target threat model and candidate security design, not an audit, proof or claim of production readiness. The user subsequently authorized implementation; [arc-exp-1](experimental-profile.md) defines the narrower implemented key/format behavior, including the single-root bootstrap and remaining differences from this target. Cryptographic and recovery review gates in [the decision register](decisions-and-sources.md) remain open for a stable/production profile.
 
 ## 1. Assets and adversaries
 

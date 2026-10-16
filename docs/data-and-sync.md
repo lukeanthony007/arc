@@ -1,6 +1,6 @@
 # Data, versions and exchange
 
-Part of the [Arc design review draft](../DESIGN.md). All choices below are proposed. This describes semantic records and algorithms; it is not a frozen byte-level wire specification. Gates W1–W5 in [the decision register](decisions-and-sources.md) must be closed before implementation.
+Part of the [Arc design review draft](../DESIGN.md). This describes target semantic records and algorithms, not the current experimental wire format. After the user's instruction to begin implementation, the smaller [arc-exp-1 profile](experimental-profile.md) implements signed single-root snapshots and offline transfer; paged closures, epochs and live reconciliation below remain target work. Gates W1–W5 in [the decision register](decisions-and-sources.md) remain open for the stable full protocol.
 
 ## 1. Identifiers and canonical records
 
