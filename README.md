@@ -2,11 +2,11 @@
 
 **Encrypted storage. Verifiable sync. Independent of the carrier.**
 
-Arc is a Rust project for keeping files across devices without depending on a central storage service. Capture an encrypted snapshot, move it through a network or on a drive, and verify exactly what arrived before restoring it.
+Arc is an experimental Rust system for decentralized, encrypted file storage and verifiable synchronization. Each device keeps a local collection. Capture a version, carry its encrypted objects through an available connection or on a drive, then verify and restore them without depending on a central storage service.
 
 Your collection should remain yours wherever its bytes travel. A device can carry encrypted data without holding the keys to read it. A lost connection should leave useful progress. Two people working offline should be able to keep both versions.
 
-> **Experimental:** the current CLI implements storage, device membership and synchronization, but the protocol is not stable or independently audited. Try it with disposable data. Linux is the currently supported platform.
+> **Under active development:** Arc has a working Linux CLI and local software verification. Physical two-device and Bluetooth qualification are still pending. The protocol is experimental and has not had an independent security audit.
 
 ## How it works
 
@@ -20,7 +20,7 @@ For example, two laptops can start with the same collection and make changes whi
 
 Storage and exchange need no mandatory server. Each private collection currently has an administrator who controls membership through signed policies; ordinary authorized work can happen offline.
 
-## What works today
+## Implemented capabilities
 
 - **Encrypted snapshots and restore.** Capture folders, verify signatures and content, and restore a chosen version into a new directory.
 - **History and explicit merges.** List versions, compare changes, select a working base and preserve concurrent offline work.
@@ -28,7 +28,7 @@ Storage and exchange need no mandatory server. Each private collection currently
 - **Independent devices.** Enroll readers or writers, distribute signed policy updates, revoke members and rotate content keys.
 - **Offline and live exchange.** Export opaque transfer bundles or connect to a peer whose transport key you have explicitly verified. Live synchronization requests missing objects.
 - **Interrupted-transfer progress.** Durable partial objects survive reconnects and receiver restarts in TCP, RFCOMM and constrained simulations. Reconnects request missing fragments, and only complete verified objects enter the store.
-- **Recovery and repair.** Create a password-authenticated backup of retained objects, membership state and keys; recover to a fresh node, or explicitly complete a journaled membership update interrupted between writes.
+- **Streaming recovery and journal repair.** Back up retained objects, membership state and keys without buffering the whole collection. Recover into a new node, or explicitly complete a journaled membership update interrupted between writes.
 - **Local diagnostics.** Explain identity, selected and competing versions, pending work and ciphertext integrity through `status` and `doctor`, with suggested actions.
 
 Arc currently uses deliberate CLI operations. Automatic folder watching, background synchronization and peer discovery are outside this implementation.
@@ -63,9 +63,13 @@ Replace `SNAPSHOT_ID` below with the snapshot ID printed by `capture`. Use the s
 ./target/debug/arc restore "$ARC_DEMO/node" SNAPSHOT_ID "$ARC_DEMO/restored"
 cmp "$ARC_DEMO/source/note.txt" "$ARC_DEMO/restored/note.txt"
 ./target/debug/arc history "$ARC_DEMO/node"
+./target/debug/arc status "$ARC_DEMO/node"
+./target/debug/arc doctor "$ARC_DEMO/node"
 ```
 
 A successful `cmp` prints nothing. Verification reports ciphertext completeness, checked ancestry and whether plaintext was verified. It also reports global freshness as unknown: a disconnected node cannot know whether another device has a newer version.
+
+`status` explains the locally known identity, selected version, competing heads and pending work. `doctor` reports ciphertext integrity and trust-state problems with suggested actions. Both operate without unlocking files or changing the node; decrypting verification remains a separate step.
 
 To make a portable transfer file:
 
@@ -92,11 +96,18 @@ Transport identity and collection membership are separate. A live exchange trans
 
 Recovery recreates the backed-up device identity; use enrollment to add an independent device. New complete backups contain the retained object inventory and policy/key state. Legacy keys-only backups remain readable. Neither proves that the backed-up policy is still current elsewhere.
 
-## Current boundaries and next work
+```sh
+./target/debug/arc recovery-export "$ARC_DEMO/node" "$ARC_DEMO/backup.arc"
+./target/debug/arc recover "$ARC_DEMO/recovered" "$ARC_DEMO/backup.arc" --trust-genesis GENESIS_ID
+```
+
+Replace `GENESIS_ID` with the independently retained value from `init`. Recovery verifies the complete backup before publishing the new node and leaves its working version unselected. New V3 backups stream authenticated records; older V2 and keys-only kits remain readable.
+
+## Development status and limits
 
 Revocation takes effect as devices receive the new policy. It cannot erase plaintext or keys a former member already holds. Granting a content key can also expose historical ciphertext encrypted with that key; access is currently collection-wide.
 
-Journal repair covers newly prepared membership transitions. Legacy incomplete markers and signed-policy forks remain blocked for investigation. New complete backups stream authenticated records with a 16 GiB encoded limit; missing historical keys or objects cannot be recreated. Older recovery formats remain readable.
+Journal repair covers newly prepared membership transitions. Legacy incomplete markers and signed-policy forks remain blocked for investigation. Streaming backups have a 16 GiB encoded limit and a 1,000,000-object ceiling; individual objects remain limited to 1 MiB. Capture, history and exchange have their own smaller bounds. A larger backup limit does not remove those constraints or recreate missing historical keys and objects.
 
 Physical two-device and Bluetooth validation remain pending. The [hardware runbook](docs/reliability-and-carriers.md#two-device-acceptance-runbook) separates those checks from local process, pseudoterminal and simulator verification. Stable formats, independent security review and power-loss qualification also remain open.
 
@@ -110,7 +121,11 @@ cargo clippy --all-targets --locked -- -D warnings
 CARGO_PROFILE_TEST_OPT_LEVEL=2 cargo test --all-targets --locked
 ```
 
-The [earlier verification record](docs/device-and-sync-profile.md#verification-and-remaining-limits) covers the original 35-test implementation and 27-operation CLI exercise. For the recovery/resumption sprint, run `python3 tools/sprint_demo.py` after building; its disposable local workflow is described in the [reliability guide](docs/reliability-and-carriers.md). A successful local run does not qualify physical carriers.
+The latest [verification record](docs/release-readiness.md#readiness-verification-record) covers 79 passing tests, strict Clippy, two 100,000-case parser mutation campaigns, abrupt-process recovery, signed format compatibility and exact recovery beyond the old 64 MiB backup ceiling. These are local software checks; physical carrier qualification and an independent external security review remain open.
+
+The [measured storage baseline](docs/benchmarks.md#measured-release-build-baseline) restored every file from a roughly 98 MiB backup with about 68 MiB peak memory during export and recovery. It is one synthetic workload, not a general performance guarantee. A separate constrained-contact simulation preserved progress and converged across 11 short contacts.
+
+For a reproducible local walkthrough after building, run `python3 tools/sprint_demo.py`. The [readiness guide](docs/release-readiness.md) also documents storage benchmarks, an explicit one-host rehearsal of the two-host runner, and local experimental packaging. These tools are available for development; they do not establish production or hardware readiness.
 
 ## Read the design
 
