@@ -1,0 +1,667 @@
+//! Single-root experimental collection operations; no membership or network service.
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail, ensure};
+use rand::{RngCore, rngs::OsRng};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+use crate::crypto::Secrets;
+use crate::format::{
+    self, CHUNK_SIZE, Entry, Genesis, Id, MAX_CHUNKS, MAX_ENTRIES, Record, Snapshot,
+};
+use crate::store::Store;
+
+const MAX_HISTORY: usize = 4096;
+const MAX_TOTAL_BYTES: u64 = MAX_CHUNKS as u64 * CHUNK_SIZE as u64;
+
+/// Exact, scoped observations. `materialized` requires a key and complete plaintext validation.
+#[derive(Debug)]
+pub struct Verification {
+    pub snapshot: Id,
+    pub genesis: Id,
+    pub objects: usize,
+    pub bytes: u64,
+    pub ancestors: usize,
+    pub materialized: bool,
+}
+
+fn random_id() -> Id {
+    let mut value = [0; 32];
+    OsRng.fill_bytes(&mut value);
+    value
+}
+
+fn pinned(store: &Store) -> Result<(Id, Genesis)> {
+    let raw = store.read_control("genesis")?;
+    let genesis_id: Id = raw
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid genesis pin"))?;
+    let Record::Genesis(genesis) = format::inspect(&store.get(&genesis_id)?)? else {
+        bail!("pinned object is not a genesis record");
+    };
+    Ok((genesis_id, genesis))
+}
+
+fn secrets(store: &Store, password: &str, genesis: &Genesis) -> Result<Secrets> {
+    let keys = Secrets::unlock(&genesis.collection, &store.read_control("keys")?, password)?;
+    ensure!(
+        keys.root() == genesis.root,
+        "key material does not match pinned root"
+    );
+    Ok(keys)
+}
+
+/// Creates a new, explicit local collection. Never reuses an existing directory.
+pub fn init(path: &Path, password: &str) -> Result<Id> {
+    ensure!(!password.is_empty(), "empty passwords are not allowed");
+    let keys = Secrets::generate();
+    let collection = random_id();
+    let genesis_bytes = keys.sign_genesis(collection)?;
+    let encrypted_keys = keys.lock(&collection, password)?;
+    let store = Store::create(path)?;
+    let genesis_id = store.put(&genesis_bytes)?;
+    store.write_new_control("keys", &encrypted_keys)?;
+    store.write_new_control("genesis", &genesis_id)?;
+    Ok(genesis_id)
+}
+
+fn snapshot(store: &Store, id: &Id, genesis_id: &Id, genesis: &Genesis) -> Result<Snapshot> {
+    let Record::Snapshot(record) = format::inspect(&store.get(id)?)? else {
+        bail!("expected a snapshot record");
+    };
+    ensure!(
+        record.collection == genesis.collection && record.genesis == *genesis_id,
+        "snapshot belongs to a different collection"
+    );
+    ensure!(
+        record.writer == genesis.root,
+        "snapshot signer is not the pinned root"
+    );
+    Ok(record)
+}
+
+/// Verifies ancestry descriptors without requiring historical payload retention.
+fn ancestry(
+    store: &Store,
+    root: &Id,
+    genesis_id: &Id,
+    genesis: &Genesis,
+) -> Result<BTreeMap<Id, Snapshot>> {
+    let mut visited = BTreeMap::new();
+    let mut active = BTreeSet::new();
+    let mut stack = vec![(*root, false)];
+    while let Some((id, exiting)) = stack.pop() {
+        if exiting {
+            active.remove(&id);
+            continue;
+        }
+        ensure!(!active.contains(&id), "snapshot ancestry cycle");
+        if visited.contains_key(&id) {
+            continue;
+        }
+        ensure!(
+            visited.len() < MAX_HISTORY,
+            "snapshot history limit exceeded"
+        );
+        let record = snapshot(store, &id, genesis_id, genesis)?;
+        active.insert(id);
+        stack.push((id, true));
+        for parent in record.parents.iter().rev() {
+            ensure!(!active.contains(parent), "snapshot ancestry cycle");
+            stack.push((*parent, false));
+        }
+        visited.insert(id, record);
+    }
+    Ok(visited)
+}
+
+fn inspect_closure(store: &Store, record: &Snapshot) -> Result<u64> {
+    ensure!(
+        record.objects.contains(&record.manifest),
+        "manifest is absent from closure"
+    );
+    let mut bytes = 0_u64;
+    for id in &record.objects {
+        let object = store.get(id)?;
+        let Record::Encrypted { collection, kind } = format::inspect(&object)? else {
+            bail!("snapshot closure contains a non-encrypted record");
+        };
+        ensure!(
+            collection == record.collection,
+            "cross-collection closure object"
+        );
+        ensure!(
+            kind == if *id == record.manifest { 2 } else { 1 },
+            "wrong encrypted object kind"
+        );
+        bytes = bytes
+            .checked_add(object.len() as u64)
+            .context("closure length overflow")?;
+    }
+    Ok(bytes)
+}
+
+fn entries_for(store: &Store, record: &Snapshot, keys: &Secrets) -> Result<Vec<Entry>> {
+    let manifest =
+        Zeroizing::new(keys.open(&record.collection, 2, &store.get(&record.manifest)?)?);
+    let entries = format::decode_manifest(&manifest)?;
+    let mut expected = BTreeSet::from([record.manifest]);
+    let mut total_refs = 0_usize;
+    let mut total_bytes = 0_u64;
+    for entry in &entries {
+        if entry.directory {
+            continue;
+        }
+        total_bytes = total_bytes
+            .checked_add(entry.size)
+            .context("file length overflow")?;
+        ensure!(
+            total_bytes <= MAX_TOTAL_BYTES,
+            "snapshot plaintext byte limit exceeded"
+        );
+        total_refs = total_refs
+            .checked_add(entry.chunks.len())
+            .context("reference count overflow")?;
+        ensure!(
+            total_refs <= MAX_CHUNKS,
+            "snapshot reference limit exceeded"
+        );
+        let mut hash = Sha256::new();
+        let mut size = 0_u64;
+        for (index, id) in entry.chunks.iter().enumerate() {
+            let chunk = Zeroizing::new(keys.open(&record.collection, 1, &store.get(id)?)?);
+            ensure!(
+                !chunk.is_empty() && chunk.len() <= CHUNK_SIZE,
+                "invalid plaintext chunk size"
+            );
+            ensure!(
+                index + 1 == entry.chunks.len() || chunk.len() == CHUNK_SIZE,
+                "short nonfinal chunk"
+            );
+            size = size
+                .checked_add(chunk.len() as u64)
+                .context("file length overflow")?;
+            ensure!(
+                size <= entry.size,
+                "chunk lengths exceed declared file size"
+            );
+            hash.update(&*chunk);
+            expected.insert(*id);
+        }
+        ensure!(size == entry.size, "file length mismatch");
+        let digest: Id = hash.finalize().into();
+        ensure!(digest == entry.digest, "file digest mismatch");
+    }
+    let actual: BTreeSet<Id> = record.objects.iter().copied().collect();
+    ensure!(
+        expected == actual,
+        "manifest and public ciphertext closure disagree"
+    );
+    Ok(entries)
+}
+
+pub fn verify(path: &Path, selected: &Id, password: Option<&str>) -> Result<Verification> {
+    let store = Store::open(path)?;
+    let (genesis_id, genesis) = pinned(&store)?;
+    let graph = ancestry(&store, selected, &genesis_id, &genesis)?;
+    let record = graph.get(selected).context("missing selected snapshot")?;
+    let bytes = inspect_closure(&store, record)?;
+    if let Some(password) = password {
+        let keys = secrets(&store, password, &genesis)?;
+        entries_for(&store, record, &keys)?;
+    }
+    Ok(Verification {
+        snapshot: *selected,
+        genesis: genesis_id,
+        objects: record.objects.len(),
+        bytes,
+        ancestors: graph.len() - 1,
+        materialized: password.is_some(),
+    })
+}
+
+struct Capture<'a> {
+    store: &'a Store,
+    keys: &'a Secrets,
+    collection: &'a Id,
+    entries: Vec<Entry>,
+    previous: BTreeMap<String, Id>,
+    objects: BTreeSet<Id>,
+    chunks: usize,
+    bytes: u64,
+}
+
+impl Capture<'_> {
+    fn directory(&mut self, anchored: &Path, relative: &str) -> Result<()> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                rustix::fs::OFlags::NOFOLLOW.bits() as i32
+                    | rustix::fs::OFlags::DIRECTORY.bits() as i32,
+            )
+            .open(anchored)
+            .context("cannot open source directory safely")?;
+        // Linux descriptor anchoring prevents a renamed directory being replaced with a symlink.
+        use std::os::fd::AsRawFd;
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        let before = dir.metadata()?;
+        let mut names = Vec::new();
+        for item in fs::read_dir(&fd_path)? {
+            ensure!(
+                self.entries.len() + names.len() < MAX_ENTRIES,
+                "entry limit exceeded"
+            );
+            names.push(
+                item?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 source name"))?,
+            );
+        }
+        names.sort();
+        for name in names {
+            ensure!(
+                !name.contains(['/', '\\']) && name != "." && name != "..",
+                "unsupported source name"
+            );
+            ensure!(name.len() <= 255, "name length limit exceeded");
+            let path = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            ensure!(
+                path.len() <= 4096 && path.split('/').count() <= 64,
+                "path limit exceeded"
+            );
+            ensure!(self.entries.len() < MAX_ENTRIES, "entry limit exceeded");
+            let child_name = path.rsplit('/').next().context("missing source name")?;
+            let child = fd_path.join(child_name);
+            let metadata = fs::symlink_metadata(&child)?;
+            let entry_id = self.previous.get(&path).copied().unwrap_or_else(random_id);
+            if metadata.is_dir() {
+                self.entries.push(Entry {
+                    entry_id,
+                    path: path.clone(),
+                    directory: true,
+                    size: 0,
+                    digest: Sha256::digest([]).into(),
+                    chunks: Vec::new(),
+                });
+                self.directory(&child, &path)?;
+            } else if metadata.is_file() {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        rustix::fs::OFlags::NOFOLLOW.bits() as i32
+                            | rustix::fs::OFlags::NONBLOCK.bits() as i32,
+                    )
+                    .open(&child)?;
+                let start = file.metadata()?;
+                ensure!(
+                    start.is_file()
+                        && start.dev() == metadata.dev()
+                        && start.ino() == metadata.ino(),
+                    "source file changed while opening"
+                );
+                ensure!(
+                    start.len() <= MAX_TOTAL_BYTES.saturating_sub(self.bytes),
+                    "snapshot byte limit exceeded"
+                );
+                let mut chunks = Vec::new();
+                let mut hash = Sha256::new();
+                let mut size = 0_u64;
+                loop {
+                    let mut buffer = Zeroizing::new(vec![0; CHUNK_SIZE]);
+                    let mut used = 0;
+                    while used < CHUNK_SIZE {
+                        let count = file.read(&mut buffer[used..])?;
+                        if count == 0 {
+                            break;
+                        }
+                        used += count;
+                    }
+                    if used == 0 {
+                        break;
+                    }
+                    self.chunks += 1;
+                    // One public closure slot is reserved for the encrypted manifest.
+                    ensure!(
+                        self.chunks < MAX_CHUNKS,
+                        "snapshot chunk limit exceeded (manifest slot reserved)"
+                    );
+                    self.bytes += used as u64;
+                    ensure!(
+                        self.bytes <= MAX_TOTAL_BYTES,
+                        "snapshot byte limit exceeded"
+                    );
+                    hash.update(&buffer[..used]);
+                    size += used as u64;
+                    let encrypted = self.keys.seal(self.collection, 1, &buffer[..used])?;
+                    let id = self.store.put(&encrypted)?;
+                    chunks.push(id);
+                    self.objects.insert(id);
+                    if used < CHUNK_SIZE {
+                        break;
+                    }
+                }
+                let finish = file.metadata()?;
+                let after_path = fs::symlink_metadata(&child)?;
+                ensure!(
+                    same_file(&start, &finish)
+                        && same_file(&start, &after_path)
+                        && size == start.len(),
+                    "source file changed during capture"
+                );
+                self.entries.push(Entry {
+                    entry_id,
+                    path,
+                    directory: false,
+                    size,
+                    digest: hash.finalize().into(),
+                    chunks,
+                });
+            } else {
+                bail!("symlinks and special source files are unsupported");
+            }
+        }
+        ensure!(
+            same_file(&before, &dir.metadata()?),
+            "source directory changed during capture"
+        );
+        Ok(())
+    }
+}
+
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
+        && a.file_type() == b.file_type()
+}
+
+pub fn capture(path: &Path, source: &Path, password: &str) -> Result<Id> {
+    let store = Store::open(path)?;
+    let writer_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(
+            rustix::fs::OFlags::NOFOLLOW.bits() as i32 | rustix::fs::OFlags::NONBLOCK.bits() as i32,
+        )
+        .open(store.path().join("control/writer.lock"))?;
+    ensure!(writer_lock.metadata()?.is_file(), "invalid writer lock");
+    writer_lock
+        .try_lock()
+        .context("another local writer is active")?;
+    let (genesis_id, genesis) = pinned(&store)?;
+    let keys = secrets(&store, password, &genesis)?;
+    ensure!(
+        !fs::symlink_metadata(source)?.file_type().is_symlink(),
+        "source may not be a symlink"
+    );
+    let source = source.canonicalize()?;
+    let node = store.path().canonicalize()?;
+    ensure!(
+        !node.starts_with(&source),
+        "node storage may not be inside capture source"
+    );
+    let root_directory = rustix::fs::openat2(
+        rustix::fs::CWD,
+        &source,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+    )
+    .context("cannot safely anchor capture root (Linux openat2 required)")?;
+    let head = store.head()?;
+    let mut previous = BTreeMap::new();
+    if let Some(head) = head {
+        let graph = ancestry(&store, &head, &genesis_id, &genesis)?;
+        let parent = graph.get(&head).context("missing base snapshot")?;
+        inspect_closure(&store, parent)?;
+        previous = entries_for(&store, parent, &keys)?
+            .into_iter()
+            .map(|e| (e.path, e.entry_id))
+            .collect();
+    }
+    let mut state = Capture {
+        store: &store,
+        keys: &keys,
+        collection: &genesis.collection,
+        entries: Vec::new(),
+        previous,
+        objects: BTreeSet::new(),
+        chunks: 0,
+        bytes: 0,
+    };
+    use std::os::fd::AsRawFd;
+    let anchored_root = PathBuf::from(format!("/proc/self/fd/{}/.", root_directory.as_raw_fd()));
+    state.directory(&anchored_root, "")?;
+    state
+        .entries
+        .sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    let manifest_plain = Zeroizing::new(format::encode_manifest(&state.entries)?);
+    let manifest = store.put(&keys.seal(&genesis.collection, 2, &manifest_plain)?)?;
+    state.objects.insert(manifest);
+    ensure!(
+        state.objects.len() <= MAX_CHUNKS,
+        "snapshot closure limit exceeded"
+    );
+    let snapshot = Snapshot {
+        collection: genesis.collection,
+        genesis: genesis_id,
+        writer: keys.root(),
+        parents: head.into_iter().collect(),
+        manifest,
+        objects: state.objects.into_iter().collect(),
+    };
+    let bytes = keys.sign_snapshot(&snapshot)?;
+    // Publishing the pointer follows complete local validation and durable object writes.
+    let id = store.put(&bytes)?;
+    inspect_closure(&store, &snapshot)?;
+    entries_for(&store, &snapshot, &keys)?;
+    ensure!(
+        store.head()? == head,
+        "local head changed during capture; snapshot retained, head not updated"
+    );
+    store.set_head(&id)?;
+    Ok(id)
+}
+
+struct Staging(PathBuf);
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn restore(path: &Path, selected: &Id, destination: &Path, password: &str) -> Result<()> {
+    let store = Store::open(path)?;
+    let (genesis_id, genesis) = pinned(&store)?;
+    let keys = secrets(&store, password, &genesis)?;
+    let graph = ancestry(&store, selected, &genesis_id, &genesis)?;
+    let record = graph.get(selected).context("missing selected snapshot")?;
+    inspect_closure(&store, record)?;
+    let entries = entries_for(&store, record, &keys)?;
+    ensure!(
+        destination.file_name().is_some(),
+        "restore destination must name a new directory"
+    );
+    ensure!(
+        !destination.try_exists()?,
+        "restore destination already exists"
+    );
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = parent.canonicalize()?;
+    let destination = parent.join(destination.file_name().context("invalid destination")?);
+    let stage = Staging(parent.join(format!(".arc-restore-{}", hex::encode(random_id()))));
+    fs::DirBuilder::new().mode(0o700).create(&stage.0)?;
+    for entry in &entries {
+        let output = stage.0.join(&entry.path);
+        if entry.directory {
+            fs::DirBuilder::new().mode(0o700).create(&output)?;
+        } else {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .open(&output)?;
+            let mut hash = Sha256::new();
+            let mut size = 0_u64;
+            for id in &entry.chunks {
+                let plain = Zeroizing::new(keys.open(&genesis.collection, 1, &store.get(id)?)?);
+                file.write_all(&plain)?;
+                hash.update(&*plain);
+                size += plain.len() as u64;
+            }
+            let digest: Id = hash.finalize().into();
+            ensure!(
+                size == entry.size && digest == entry.digest,
+                "restore content changed"
+            );
+            file.sync_all()?;
+        }
+    }
+    // Flush nested directories before publishing the new destination.
+    for entry in entries.iter().rev().filter(|e| e.directory) {
+        File::open(stage.0.join(&entry.path))?.sync_all()?;
+    }
+    File::open(&stage.0)?.sync_all()?;
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &stage.0,
+        rustix::fs::CWD,
+        &destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .context("cannot publish restore without overwriting destination")?;
+    File::open(&parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Exports pinned genesis, ancestry descriptors, and the selected snapshot's ciphertext closure.
+pub fn export(path: &Path, selected: &Id, destination: &Path) -> Result<()> {
+    let store = Store::open(path)?;
+    let (genesis_id, genesis) = pinned(&store)?;
+    let graph = ancestry(&store, selected, &genesis_id, &genesis)?;
+    let record = graph.get(selected).context("missing selected snapshot")?;
+    inspect_closure(&store, record)?;
+    let mut ids: BTreeSet<Id> = graph.keys().copied().collect();
+    ids.insert(genesis_id);
+    ids.extend(record.objects.iter().copied());
+    crate::bundle::export(&store, &ids.into_iter().collect::<Vec<_>>(), destination)
+}
+
+/// Imports bytes without changing the trusted genesis, keys or current head.
+pub fn import(path: &Path, source: &Path) -> Result<usize> {
+    let store = Store::open(path)?;
+    pinned(&store)?;
+    Ok(crate::bundle::import(&store, source)?.len())
+}
+
+/// Recovery carries no data: identity pin + existing encrypted key blob, independently authenticated.
+pub fn export_recovery(path: &Path, destination: &Path) -> Result<()> {
+    let store = Store::open(path)?;
+    let (genesis_id, _) = pinned(&store)?;
+    let genesis_bytes = store.get(&genesis_id)?;
+    let keys = store.read_control("keys")?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(".arc-keys-{}", hex::encode(random_id())));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&temporary)?;
+    let result = (|| -> Result<()> {
+        output.write_all(b"ARCKEY1\n")?;
+        output.write_all(&genesis_id)?;
+        output.write_all(&(genesis_bytes.len() as u32).to_be_bytes())?;
+        output.write_all(&genesis_bytes)?;
+        output.write_all(&(keys.len() as u32).to_be_bytes())?;
+        output.write_all(&keys)?;
+        output.sync_all()?;
+        fs::hard_link(&temporary, destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+/// Explicitly reconstructs a new local node, requiring a separately supplied trusted genesis ID.
+/// It restores the same single-device identity: do not use the clone for concurrent publication.
+pub fn recover(path: &Path, kit: &Path, expected_genesis: &Id, password: &str) -> Result<()> {
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            rustix::fs::OFlags::NOFOLLOW.bits() as i32 | rustix::fs::OFlags::NONBLOCK.bits() as i32,
+        )
+        .open(kit)?;
+    ensure!(
+        input.metadata()?.is_file()
+            && input.metadata()?.len() <= 2 * format::MAX_OBJECT as u64 + 48,
+        "invalid recovery kit file"
+    );
+    let mut magic = [0; 8];
+    input.read_exact(&mut magic)?;
+    ensure!(&magic == b"ARCKEY1\n", "unsupported recovery kit");
+    let mut genesis_id = [0; 32];
+    input.read_exact(&mut genesis_id)?;
+    ensure!(
+        &genesis_id == expected_genesis,
+        "recovery identity pin mismatch"
+    );
+    let mut read_record = || -> Result<Vec<u8>> {
+        let mut raw = [0; 4];
+        input.read_exact(&mut raw)?;
+        let size = u32::from_be_bytes(raw) as usize;
+        ensure!(
+            size > 0 && size <= format::MAX_OBJECT,
+            "recovery record size out of bounds"
+        );
+        let mut data = vec![0; size];
+        input.read_exact(&mut data)?;
+        Ok(data)
+    };
+    let genesis_bytes = read_record()?;
+    let locked_keys = read_record()?;
+    let mut trailing = [0];
+    ensure!(
+        input.read(&mut trailing)? == 0,
+        "trailing recovery kit bytes"
+    );
+    ensure!(
+        format::id(&genesis_bytes) == genesis_id,
+        "recovery genesis digest mismatch"
+    );
+    let Record::Genesis(genesis) = format::inspect(&genesis_bytes)? else {
+        bail!("invalid recovery genesis");
+    };
+    let keys = Secrets::unlock(&genesis.collection, &locked_keys, password)?;
+    ensure!(keys.root() == genesis.root, "recovery key/root mismatch");
+    let store = Store::create(path)?;
+    store.put(&genesis_bytes)?;
+    store.write_new_control("keys", &locked_keys)?;
+    store.write_new_control("genesis", &genesis_id)?;
+    Ok(())
+}

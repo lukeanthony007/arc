@@ -1,0 +1,33 @@
+[package]
+name = "arc-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Experimental transport-independent encrypted snapshot storage"
+publish = false
+
+[lib]
+name = "arc_store"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+argon2 = { version = "0.5", features = ["std", "zeroize"] }
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+hex = "0.4"
+minicbor = { version = "0.26", features = ["std"] }
+rand = "0.8"
+rpassword = "7.4"
+rustix = { version = "1.1", features = ["fs"] }
+sha2 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.20"
