@@ -142,13 +142,19 @@ impl Store {
         check_control_name(name)?;
         read_bounded(&self.path.join("control").join(name), MAX_OBJECT)
     }
-    pub fn clear_membership_pending(&self) -> Result<()> {
-        let path = self.path.join("control/membership-pending");
-        match fs::remove_file(&path) {
-            Ok(()) => sync_dir(&self.path.join("control")),
+    /// Remove only an allowed local control file and persist the directory update.
+    pub fn remove_control(&self, name: &str) -> Result<()> {
+        check_control_name(name)?;
+        let dir = self.path.join("control");
+        check_dir(&dir)?;
+        match fs::remove_file(dir.join(name)) {
+            Ok(()) => sync_dir(&dir),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+    pub fn clear_membership_pending(&self) -> Result<()> {
+        self.remove_control("membership-pending")
     }
     pub fn set_head(&self, id: &Id) -> Result<()> {
         let dir = self.path.join("control");

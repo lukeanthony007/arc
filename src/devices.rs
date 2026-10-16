@@ -15,7 +15,7 @@ use std::{
     path::Path,
 };
 
-const MAX_PACKAGE: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_PACKAGE: usize = 8 * 1024 * 1024;
 fn read(path: &Path, max: usize) -> Result<Vec<u8>> {
     let f = OpenOptions::new()
         .read(true)
@@ -38,6 +38,30 @@ fn write_new(path: &Path, b: &[u8]) -> Result<()> {
     f.sync_all()?;
     Ok(())
 }
+fn ensure_output_available(path: &Path, expected: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+        Ok(_) => {
+            ensure!(
+                read(path, MAX_PACKAGE)? == expected,
+                "output path already contains different data"
+            );
+            Ok(())
+        }
+    }
+}
+fn absolute_output_path(path: &Path) -> Result<std::path::PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output path has no filename"))?;
+    ensure!(!name.is_empty(), "output path has no filename");
+    Ok(std::fs::canonicalize(parent)?.join(name))
+}
 fn writer_lock(store: &Store) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -52,6 +76,13 @@ fn writer_lock(store: &Store) -> Result<File> {
     ensure!(file.metadata()?.is_file(), "invalid writer lock");
     file.try_lock().context("another local writer is active")?;
     Ok(file)
+}
+fn ensure_no_pending(store: &Store) -> Result<()> {
+    match std::fs::symlink_metadata(store.path().join("control/membership-pending")) {
+        Ok(_) => anyhow::bail!("membership transition is pending; run explicit repair"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 fn chain(store: &Store, head: &Policy, authority: &[u8; 32]) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
@@ -156,34 +187,37 @@ fn encode_rotation_package(
     Ok(b)
 }
 
-fn archive_key(store: &Store, policy: &Policy, authority: &[u8; 32]) -> Result<()> {
-    let mut records: Vec<(Id, Vec<u8>)> =
-        if std::fs::symlink_metadata(store.path().join("control/keys-history")).is_ok() {
-            let b = store.read_control("keys-history")?;
-            let mut d = Decoder::new(&b);
-            ensure!(d.array()? == Some(2) && d.u8()? == 1, "invalid key history");
-            let n = d
-                .array()?
-                .ok_or_else(|| anyhow::anyhow!("indefinite key history"))?
-                as usize;
-            ensure!(n <= 4096, "key history too large");
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                ensure!(d.array()? == Some(2), "invalid key history entry");
-                v.push((d.bytes()?.try_into()?, d.bytes()?.to_vec()));
-            }
-            ensure!(d.position() == b.len(), "trailing key history data");
-            v
-        } else {
-            Vec::new()
-        };
-    let current = store.read_control("keys")?;
+fn history_after(
+    store: &Store,
+    policy: &Policy,
+    authority: &[u8; 32],
+    key: &[u8],
+) -> Result<Vec<u8>> {
+    let mut records: Vec<(Id, Vec<u8>)> = if let Some(b) =
+        crate::membership::read_optional_control(store, "keys-history")?
+    {
+        let mut d = Decoder::new(&b);
+        ensure!(d.array()? == Some(2) && d.u8()? == 1, "invalid key history");
+        let n = d
+            .array()?
+            .ok_or_else(|| anyhow::anyhow!("indefinite key history"))? as usize;
+        ensure!(n <= 4096, "key history too large");
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            ensure!(d.array()? == Some(2), "invalid key history entry");
+            v.push((d.bytes()?.try_into()?, d.bytes()?.to_vec()));
+        }
+        ensure!(d.position() == b.len(), "trailing key history data");
+        v
+    } else {
+        Vec::new()
+    };
     policy.verify(authority)?;
     let id = policy.id()?;
     if let Some((_, old)) = records.iter().find(|(existing, _)| *existing == id) {
-        ensure!(old == &current, "conflicting archived key for policy");
+        ensure!(old == key, "conflicting archived key for policy");
     } else {
-        records.push((id, current));
+        records.push((id, key.to_vec()));
     }
     ensure!(records.len() <= 4096, "key history limit exceeded");
     let mut b = Vec::new();
@@ -192,7 +226,18 @@ fn archive_key(store: &Store, policy: &Policy, authority: &[u8; 32]) -> Result<(
     for (id, key) in records {
         e.array(2)?.bytes(&id)?.bytes(&key)?;
     }
-    store.set_control("keys-history", &b)
+    Ok(b)
+}
+fn control_change(
+    store: &Store,
+    name: &str,
+    after: Option<Vec<u8>>,
+) -> Result<crate::membership::ControlChange> {
+    Ok(crate::membership::ControlChange {
+        name: name.to_owned(),
+        before: crate::membership::read_optional_control(store, name)?,
+        after,
+    })
 }
 pub fn secrets_for_policy(store: &Store, policy_id: Id, password: &str) -> Result<Secrets> {
     match std::fs::symlink_metadata(store.path().join("control/membership-pending")) {
@@ -241,23 +286,43 @@ pub fn secrets_for_policy(store: &Store, policy_id: Id, password: &str) -> Resul
     Ok(keys)
 }
 pub fn enable(node: &Path, password: &str) -> Result<()> {
+    enable_with_failpoint(node, password, None)
+}
+#[doc(hidden)]
+pub fn enable_with_failpoint(node: &Path, password: &str, fail_after: Option<usize>) -> Result<()> {
     let store = Store::open(node)?;
     let _writer_lock = writer_lock(&store)?;
-    let (_, genesis) = app::pinned(&store)?;
+    ensure_no_pending(&store)?;
+    let (genesis_id, genesis) = app::pinned(&store)?;
     let keys = app::secrets(&store, password, &genesis)?;
     ensure!(
         keys.root() == genesis.root,
         "only genesis authority can enable membership"
     );
+    ensure!(
+        Policy::load(&store, &genesis.root)?.is_none(),
+        "membership policy is already enabled"
+    );
     let accepted = crate::history::list(node)?
         .into_iter()
         .map(|x| x.id)
         .collect();
-    store.write_new_control("membership-pending", b"enable")?;
-    let policy = enrollment::enable(&store, genesis.collection, &keys, accepted)?;
-    archive_key(&store, &policy, &genesis.root)?;
-    store.clear_membership_pending()?;
-    Ok(())
+    let policy = enrollment::prepare_enable(genesis.collection, &keys, accepted)?;
+    let raw = policy.encode()?;
+    let pid = policy.id()?;
+    let locked = store.read_control("keys")?;
+    let history = history_after(&store, &policy, &genesis.root, &locked)?;
+    let plan = crate::membership::Plan {
+        genesis: genesis_id,
+        objects: vec![raw],
+        controls: vec![
+            control_change(&store, "policy", Some(pid.to_vec()))?,
+            control_change(&store, "keys", Some(locked.clone()))?,
+            control_change(&store, "keys-history", Some(history))?,
+        ],
+        output: None,
+    };
+    crate::membership::commit(&store, password, &plan, fail_after)
 }
 /// Create a new independently keyed device; private key material is password encrypted.
 pub fn create_request(private_path: &Path, request_path: &Path, password: &str) -> Result<Request> {
@@ -275,17 +340,41 @@ pub fn grant(
     role: Role,
     password: &str,
 ) -> Result<()> {
+    grant_with_failpoint(
+        admin_node,
+        request_path,
+        invitation_path,
+        role,
+        password,
+        None,
+    )
+}
+#[doc(hidden)]
+pub fn grant_with_failpoint(
+    admin_node: &Path,
+    request_path: &Path,
+    invitation_path: &Path,
+    role: Role,
+    password: &str,
+    fail_after: Option<usize>,
+) -> Result<()> {
     let store = Store::open(admin_node)?;
     let _writer_lock = writer_lock(&store)?;
     let (genesis_id, genesis) = app::pinned(&store)?;
     let admin = app::secrets(&store, password, &genesis)?;
     let authority = genesis.root;
+    ensure_no_pending(&store)?;
     let previous = Policy::load(&store, &authority)?
         .ok_or_else(|| anyhow::anyhow!("membership policy is not enabled"))?;
-    store.write_new_control("membership-pending", b"grant")?;
-    archive_key(&store, &previous, &authority)?;
     let request = Request::decode(&read(request_path, 256)?)?;
-    let invitation = Invitation::grant(
+    ensure!(
+        !previous
+            .members
+            .iter()
+            .any(|m| m.key == request.signing && !m.revoked),
+        "device is already an active member"
+    );
+    let (invitation, successor) = enrollment::Invitation::prepare_grant(
         &store,
         genesis.collection,
         genesis_id,
@@ -294,16 +383,31 @@ pub fn grant(
         role,
         &admin,
     )?;
-    let current =
-        Policy::load(&store, &authority)?.ok_or_else(|| anyhow::anyhow!("policy disappeared"))?;
+    let raw = successor.encode()?;
+    let pid = successor.id()?;
+    let mut policies = chain(&store, &previous, &authority)?;
+    policies.push(raw.clone());
     let package = InvitePackage {
         genesis: store.get(&genesis_id)?,
-        policies: chain(&store, &current, &authority)?,
+        policies,
         invitation: invitation.encode()?,
+    }
+    .encode()?;
+    let output_path = absolute_output_path(invitation_path)?;
+    ensure_output_available(&output_path, &package)?;
+    let locked = store.read_control("keys")?;
+    let history = history_after(&store, &previous, &authority, &locked)?;
+    let plan = crate::membership::Plan {
+        genesis: genesis_id,
+        objects: vec![raw],
+        controls: vec![
+            control_change(&store, "policy", Some(pid.to_vec()))?,
+            control_change(&store, "keys", Some(locked.clone()))?,
+            control_change(&store, "keys-history", Some(history))?,
+        ],
+        output: Some((output_path, package)),
     };
-    write_new(invitation_path, &package.encode()?)?;
-    store.clear_membership_pending()?;
-    Ok(())
+    crate::membership::commit(&store, password, &plan, fail_after)
 }
 pub fn refresh(
     admin_node: &Path,
@@ -399,26 +503,50 @@ pub fn revoke(
     package_path: &Path,
     password: &str,
 ) -> Result<()> {
+    revoke_with_failpoint(admin_node, revoked, requests, package_path, password, None)
+}
+#[doc(hidden)]
+pub fn revoke_with_failpoint(
+    admin_node: &Path,
+    revoked: [u8; 32],
+    requests: &[Request],
+    package_path: &Path,
+    password: &str,
+    fail_after: Option<usize>,
+) -> Result<()> {
     let store = Store::open(admin_node)?;
     let _writer_lock = writer_lock(&store)?;
+    ensure_no_pending(&store)?;
     let (genesis_id, genesis) = app::pinned(&store)?;
+    ensure!(revoked != genesis.root, "cannot revoke the root authority");
     let mut admin = app::secrets(&store, password, &genesis)?;
-    store.write_new_control("membership-pending", b"rotation")?;
     let old = Policy::load(&store, &genesis.root)?
         .ok_or_else(|| anyhow::anyhow!("membership policy is not enabled"))?;
     let mut members = old.members.clone();
-    members
+    let target = members
         .iter_mut()
         .find(|m| m.key == revoked)
-        .ok_or_else(|| anyhow::anyhow!("member not found"))?
-        .revoked = true;
+        .ok_or_else(|| anyhow::anyhow!("member not found"))?;
+    ensure!(!target.revoked, "member is already revoked");
+    target.revoked = true;
     let active: Vec<_> = requests
         .iter()
         .filter(|r| r.signing != revoked)
         .cloned()
         .collect();
-    archive_key(&store, &old, &genesis.root)?;
-    let rotation = enrollment::rotate(
+    for request in &active {
+        request.verify()?;
+    }
+    for member in members
+        .iter()
+        .filter(|m| !m.revoked && m.key != genesis.root)
+    {
+        ensure!(
+            active.iter().filter(|r| r.signing == member.key).count() == 1,
+            "missing or duplicate encryption request for active member"
+        );
+    }
+    let rotation = enrollment::prepare_rotate(
         &store,
         genesis_id,
         &old,
@@ -427,18 +555,60 @@ pub fn revoke(
         members,
         &active,
     )?;
-    let policies = chain(&store, &rotation.policy, &genesis.root)?;
+    let raw = rotation.policy.encode()?;
+    let pid = rotation.policy.id()?;
+    let mut policies = chain(&store, &old, &genesis.root)?;
+    policies.push(raw.clone());
     let package = encode_rotation_package(&policies, &rotation.envelopes, genesis_id)?;
-    write_new(package_path, &package)?;
+    let output_path = absolute_output_path(package_path)?;
+    ensure_output_available(&output_path, &package)?;
+    let old_locked = store.read_control("keys")?;
+    let history = history_after(&store, &old, &genesis.root, &old_locked)?;
     admin.replace_epoch_key(*rotation.key);
-    store.set_control("keys", &admin.lock(&genesis.collection, password)?)?;
-    store.clear_membership_pending()?;
-    Ok(())
+    let new_locked = admin.lock(&genesis.collection, password)?;
+    let plan = crate::membership::Plan {
+        genesis: genesis_id,
+        objects: vec![raw],
+        controls: vec![
+            control_change(&store, "policy", Some(pid.to_vec()))?,
+            control_change(&store, "keys", Some(new_locked))?,
+            control_change(&store, "keys-history", Some(history))?,
+        ],
+        output: Some((output_path, package)),
+    };
+    crate::membership::commit(&store, password, &plan, fail_after)
+}
+/// Repair an interrupted membership transition using its password-authenticated journal.
+/// Unknown legacy markers are retained as fail-closed evidence.
+pub fn repair(node: &Path, password: &str) -> Result<()> {
+    let store = Store::open(node)?;
+    let _writer_lock = writer_lock(&store)?;
+    let (genesis_id, genesis) = app::pinned(&store)?;
+    match std::fs::symlink_metadata(store.path().join("control/membership-pending")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _secrets = app::secrets(&store, password, &genesis)?;
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    crate::membership::repair(&store, password, genesis_id, None)
 }
 /// Apply a root-signed rotation envelope and persist its new epoch key.
 pub fn apply(node: &Path, private_path: &Path, package_path: &Path, password: &str) -> Result<()> {
+    apply_with_failpoint(node, private_path, package_path, password, None)
+}
+#[doc(hidden)]
+pub fn apply_with_failpoint(
+    node: &Path,
+    private_path: &Path,
+    package_path: &Path,
+    password: &str,
+    fail_after: Option<usize>,
+) -> Result<()> {
     let store = Store::open(node)?;
     let _writer_lock = writer_lock(&store)?;
+    ensure_no_pending(&store)?;
     let (genesis_id, genesis) = app::pinned(&store)?;
     let device = DeviceSecrets::unlock(&read(private_path, 256)?, password)?;
     let bytes = read(package_path, MAX_PACKAGE)?;
@@ -560,23 +730,22 @@ pub fn apply(node: &Path, private_path: &Path, package_path: &Path, password: &s
     );
     let key = enrollment::apply_rotation(&env, &device, genesis.root)?;
     let mut keys = app::secrets(&store, password, &genesis)?;
-    archive_key(&store, &old, &genesis.root)?;
-    store.write_new_control("membership-pending", b"rotation")?;
-    let mut policy_id = None;
-    for raw in &policy_bytes {
-        let id = store.put(raw)?;
-        ensure!(
-            Policy::decode(raw)?.id()? == id,
-            "policy object ID mismatch"
-        );
-        policy_id = Some(id);
-    }
-    let policy_id = policy_id.expect("nonempty policy chain");
+    let old_locked = store.read_control("keys")?;
+    let history = history_after(&store, &old, &genesis.root, &old_locked)?;
     keys.replace_epoch_key(key);
-    store.set_control("keys", &keys.lock(&genesis.collection, password)?)?;
-    store.set_control("policy", &policy_id)?;
-    store.clear_membership_pending()?;
-    Ok(())
+    let locked = keys.lock(&genesis.collection, password)?;
+    let policy_id = *incoming_ids.last().expect("nonempty policy chain");
+    let plan = crate::membership::Plan {
+        genesis: genesis_id,
+        objects: policy_bytes,
+        controls: vec![
+            control_change(&store, "policy", Some(policy_id.to_vec()))?,
+            control_change(&store, "keys", Some(locked))?,
+            control_change(&store, "keys-history", Some(history))?,
+        ],
+        output: None,
+    };
+    crate::membership::commit(&store, password, &plan, fail_after)
 }
 
 #[cfg(test)]

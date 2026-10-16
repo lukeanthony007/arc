@@ -104,6 +104,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hpke",
+ "libc",
  "minicbor",
  "rand",
  "rand_core 0.9.5",

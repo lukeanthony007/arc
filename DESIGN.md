@@ -8,7 +8,7 @@ Arc is decentralized encrypted storage with verifiable synchronization independe
 
 The user-established requirements are secure decentralized data storage, source/transport independence, verifiable exchange between nodes, a ground-up redesign, and a full design before implementation. The preserved prototype's thesis is relevant; its security, anonymity, recovery and scale claims are not inherited. Luma is an independent possible consumer, not a core dependency or a reason to narrow Arc into a research archive. No AI model is part of authorization, encryption or verification.
 
-The choices below supply the working direction for the authorized implementation. The experiment now covers private collections, history and same-key ciphertext reuse, independently enrolled readers/writers, signed policy/key changes, explicit multi-parent merges, foreground authenticated TCP exchange and constrained-contact simulation. The extension documents limitations including interrupted membership recovery, policy-aware recovery-kit export and real hardware adapters. A tested subset is not completion of every larger architectural requirement.
+The choices below supply the working direction for the authorized implementation. The experiment now covers private collections, history and same-key ciphertext reuse, independently enrolled readers/writers, signed policy/key changes, explicit multi-parent merges, authenticated TCP exchange and constrained-contact simulation. The subsequent [recovery and carrier profile](docs/reliability-and-carriers.md) adds authenticated backups, interrupted-update repair, persistent fragments and an explicit Linux RFCOMM adapter; physical two-device and Bluetooth qualification remain pending. A tested subset is not completion of every larger architectural requirement.
 
 ### Intended first user and scenario
 
@@ -136,7 +136,7 @@ Recovery uses retained ciphertext plus the appropriate keys; either alone is ins
 
 **Two exchange modes.** Interactive reconciliation minimizes redundant data when a return connection exists. Offline packages declare their contents and completeness scope without requiring negotiation. They feed the same validator and object store.
 
-**Bounded first deployment.** Full replicas and selected snapshot copies precede erasure coding. Initial runnable adapters would be file packages, one explicit live IP connection and a deterministic constrained-link test adapter. Real Bluetooth, radio and SMS adapters remain intended extensions with individual profiles and hardware/provider validation; a simulator is not evidence those integrations work.
+**Bounded first deployment.** Full replicas and selected snapshot copies precede erasure coding. Runnable exchange paths include offline bundles, explicit live IP connections, a deterministic constrained-link test adapter and prepared Linux RFCOMM endpoints. Radio and SMS remain intended extensions; Bluetooth requires physical qualification. Software stream tests do not establish over-the-air delivery, routing, battery or airtime behavior.
 
 **Conservative revocation.** A policy transition commits a fixed accepted frontier from the preceding epoch. Once learned, that boundary determines which old writes remain accepted, regardless of delivery order. Late writes are preserved in quarantine for reviewed reissue. New content uses fresh keys; past disclosed plaintext cannot be recalled.
 

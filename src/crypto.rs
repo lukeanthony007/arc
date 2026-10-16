@@ -14,6 +14,77 @@ const AAD_DOMAIN: &[u8] = b"arc-exp-1/object-aad\0";
 const ROOT_DOMAIN: &[u8] = b"arc-exp-1/genesis-signature\0";
 const SNAP_DOMAIN: &[u8] = b"arc-exp-1/snapshot-signature\0";
 const KEY_DOMAIN: &[u8] = b"arc-exp-1/keystore-aad\0";
+const JOURNAL_DOMAIN: &[u8] = b"arc-exp-1/membership-journal\0";
+
+pub(crate) fn seal_journal(password: &str, genesis: &Id, plain: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        !password.is_empty() && password.len() <= 4096,
+        "invalid password length"
+    );
+    ensure!(plain.len() <= MAX_OBJECT, "membership journal too large");
+    let mut salt = [0u8; 16];
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    let params = Params::new(65536, 3, 1, Some(32))?;
+    let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0u8; 32]);
+    a.hash_password_into(password.as_bytes(), &salt, &mut *key)?;
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    let mut aad = JOURNAL_DOMAIN.to_vec();
+    aad.extend_from_slice(genesis);
+    let ct = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plain,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("membership journal encryption failed"))?;
+    let mut out = Vec::new();
+    Encoder::new(&mut out)
+        .array(5)?
+        .u8(1)?
+        .bytes(genesis)?
+        .bytes(&salt)?
+        .bytes(&nonce)?
+        .bytes(&ct)?;
+    ensure!(out.len() <= MAX_OBJECT, "membership journal too large");
+    Ok(out)
+}
+
+pub(crate) fn open_journal(password: &str, genesis: &Id, sealed: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        !password.is_empty() && password.len() <= 4096,
+        "invalid password length"
+    );
+    ensure!(sealed.len() <= MAX_OBJECT, "membership journal too large");
+    let mut d = Decoder::new(sealed);
+    ensure!(
+        d.array()? == Some(5) && d.u8()? == 1,
+        "unsupported membership journal"
+    );
+    let bound: Id = d.bytes()?.try_into()?;
+    let salt: [u8; 16] = d.bytes()?.try_into()?;
+    let nonce: [u8; 24] = d.bytes()?.try_into()?;
+    let ct = d.bytes()?;
+    ensure!(
+        d.position() == sealed.len() && &bound == genesis,
+        "journal genesis mismatch"
+    );
+    let params = Params::new(65536, 3, 1, Some(32))?;
+    let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0u8; 32]);
+    a.hash_password_into(password.as_bytes(), &salt, &mut *key)?;
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    let mut aad = JOURNAL_DOMAIN.to_vec();
+    aad.extend_from_slice(genesis);
+    let plain = cipher
+        .decrypt(XNonce::from_slice(&nonce), Payload { msg: ct, aad: &aad })
+        .map_err(|_| anyhow::anyhow!("membership journal authentication failed"))?;
+    Ok(plain)
+}
 
 pub struct Secrets {
     root_seed: [u8; 32],

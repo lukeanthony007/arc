@@ -4,6 +4,8 @@ Status: experimental implementation initiated after the user's 2026-10-16 instru
 
 The user subsequently authorized all five next milestones. This page preserves the original base format and its original verification record. Current history/reuse, membership/key lifecycle, merging, authenticated live transfer and constrained-contact behavior is specified in [the extension profile](device-and-sync-profile.md). Statements below about the original single-device slice are historical scope, not the complete current feature list.
 
+The later [recovery and carrier profile](reliability-and-carriers.md) supersedes keys-only recovery export with a complete authenticated backup, adds journal repair and persistent partial objects, and specifies the current live application protocol and RFCOMM endpoint adapter. The `ARCKEY1` layout below is retained for legacy import compatibility.
+
 ## Implemented scope
 
 A Linux Rust library and foreground CLI create a single-root collection, capture regular files/directories into encrypted chunks and an encrypted manifest, sign snapshots, verify scoped closure and ancestry, restore into a new destination, and transfer immutable objects through an offline file bundle. A separate encrypted recovery kit contains the existing root/data secrets but no source data. Import does not enroll another identity, select a head, overwrite working files or execute received content.

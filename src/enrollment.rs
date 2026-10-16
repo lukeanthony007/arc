@@ -185,6 +185,20 @@ impl Invitation {
         role: Role,
         admin: &Secrets,
     ) -> Result<Self> {
+        let (invitation, successor) =
+            Self::prepare_grant(store, collection, genesis, policy, request, role, admin)?;
+        successor.publish(store)?;
+        Ok(invitation)
+    }
+    pub fn prepare_grant(
+        store: &Store,
+        collection: Id,
+        genesis: Id,
+        policy: &Policy,
+        request: &Request,
+        role: Role,
+        admin: &Secrets,
+    ) -> Result<(Self, Policy)> {
         request.verify()?;
         ensure!(
             policy.collection == collection && policy.authority == admin.root(),
@@ -209,7 +223,7 @@ impl Invitation {
             Invitation::frontier(store, policy)?,
             admin,
         )?;
-        let id = successor.publish(store)?;
+        let id = successor.id()?;
         let aad = aad(&collection, &genesis, &id, epoch, &request.signing, role);
         let pk = <Kem as KemTrait>::PublicKey::from_bytes(&request.encryption)?;
         let (enc, mut ctx) = hpke::setup_sender::<Aead, Kdf, Kem, _>(
@@ -237,7 +251,7 @@ impl Invitation {
             signature: [0; 64],
         };
         x.signature = admin.sign_authority(&x.signing_message()?);
-        Ok(x)
+        Ok((x, successor))
     }
     pub fn verify(&self, authority: &[u8; 32]) -> Result<()> {
         ensure!(
@@ -349,6 +363,19 @@ pub fn rotate(
     genesis: Id,
     policy: &Policy,
     admin: &Secrets,
+    accepted: Vec<Id>,
+    members: Vec<Member>,
+    devices: &[Request],
+) -> Result<Rotation> {
+    let rotation = prepare_rotate(store, genesis, policy, admin, accepted, members, devices)?;
+    rotation.policy.publish(store)?;
+    Ok(rotation)
+}
+pub fn prepare_rotate(
+    store: &Store,
+    genesis: Id,
+    policy: &Policy,
+    admin: &Secrets,
     mut accepted: Vec<Id>,
     members: Vec<Member>,
     devices: &[Request],
@@ -437,7 +464,6 @@ pub fn rotate(
         envelope.signature = admin.sign_authority(&envelope.message()?);
         envelopes.push(envelope);
     }
-    next.publish(store)?;
     Ok(Rotation {
         policy: next,
         key: key.into(),
@@ -450,6 +476,11 @@ pub fn enable(
     secrets: &Secrets,
     accepted: Vec<Id>,
 ) -> Result<Policy> {
+    let policy = prepare_enable(collection, secrets, accepted)?;
+    policy.publish(store)?;
+    Ok(policy)
+}
+pub fn prepare_enable(collection: Id, secrets: &Secrets, accepted: Vec<Id>) -> Result<Policy> {
     let policy = Policy::new_with_secrets(
         collection,
         0,
@@ -462,7 +493,6 @@ pub fn enable(
         accepted,
         secrets,
     )?;
-    policy.publish(store)?;
     Ok(policy)
 }
 pub fn refresh_envelopes(

@@ -96,7 +96,7 @@ fn constrained_transfer_rejects_loss_then_resumes_from_ids() {
     assert_eq!(r.objects_received, 0);
     assert!(!dst.contains(&id).unwrap());
     let clean = Link {
-        mtu: 512,
+        mtu: 128,
         drop_every: 0,
         reorder_window: 5,
         duplicate_every: 3,

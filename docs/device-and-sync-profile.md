@@ -2,6 +2,8 @@
 
 This extension continues the experimental `arc-exp-1` core. The unchanged single-root object format is described in [the original profile](experimental-profile.md); this document describes the added operations and their limits. Stable interoperability and qualified independent cryptographic review remain open. The [five milestone contract](next-milestones.md) supplies acceptance criteria; actual verification belongs in the implementation handoff.
 
+The subsequent [recovery and carrier profile](reliability-and-carriers.md) extends this implementation with authenticated complete backups, explicit journal repair, persistent fragments and Linux RFCOMM endpoints. It defines the new live application profile and the pending hardware qualification.
+
 ## History, selection, reuse and conflicts
 
 `history NODE` lists locally authorized version descriptors and their parents, selected base and head status. Head discovery uses descriptor ancestry independently of retained file payloads. A head is relative to the records and policy known locally, not a globally newest version. Missing or rejected versions are not silently promoted.
@@ -42,9 +44,9 @@ Version-two refresh/rotation packages carry the complete ordered, root-signed po
 
 Previously held password-protected keys are indexed by verified policy IDs and retained separately from the current key. Verification, restore and diff can use an available historical key for an accepted snapshot. Catch-up does not manufacture intermediate epoch keys a device never received. New capture encrypts with the active key; the key comparison explicitly prevents cross-epoch ciphertext reuse. Newly admitted members receive only what their invitation grants; no administrator key archive is copied into the invitation.
 
-Rotation changes policy and key state locally, then recipients apply their own envelopes through any carrier. It is not an atomic change across disconnected devices. A fresh current-state capture may be needed before a newly keyed member can restore current content. Policy-managed recovery-kit export is refused until a complete policy-aware recovery format exists; the legacy root-only kit must not silently omit membership state.
+Rotation changes policy and key state locally, then recipients apply their own envelopes through any carrier. It is not an atomic change across disconnected devices. A fresh current-state capture may be needed before a newly keyed member can restore current content. `recovery-export` now produces a complete authenticated backup including retained objects, policy state and keys; legacy root-only kits remain readable. See the [recovery format and limitations](reliability-and-carriers.md#complete-recovery-backups).
 
-Membership operations use an exclusive local writer lock. A durable `membership-pending` guard blocks normal collection operations if a multi-file transition is interrupted. Automatic rollback or repair of that state is not implemented: retain the node and backup, and investigate the interrupted transition rather than deleting the guard to force publication. This is a documented availability limit, not an assertion of a completed power-loss qualification.
+Membership operations use an exclusive local writer lock. New transitions prepare their exact target and store a password-authenticated journal in `membership-pending` before publishing it. `repair NODE` completes a valid interrupted transaction without generating another key rotation. Unknown legacy markers and signed-policy forks remain blocked for investigation; never delete those guards to force publication. Fault-injection checks are not full power-loss qualification.
 
 ## Explicit live synchronization
 
@@ -52,7 +54,7 @@ Membership operations use an exclusive local writer lock. A durable `membership-
 
 The connection uses Noise XX with X25519/ChaChaPoly/BLAKE2s and compares the full expected peer static key before encrypted object inventories. Transport pins are currently explicit and separate from collection enrollment; no automatic policy-derived transport certification is claimed. Only opaque immutable objects are exchanged. Private key/control files and selected-head pointers are excluded.
 
-Inventory reconciliation requests missing IDs. Repeating a completed exchange sends no already present objects. Received objects are bounded and hash-verified by the same object store used by offline bundles. An interrupted connection can retain complete verified objects; the next contact requests what is still missing. No automatic head or membership-policy promotion occurs. The recipient uses explicit policy application and snapshot verification.
+Inventory reconciliation requests missing IDs. Repeating a completed exchange sends no already present objects. The new live profile persists complete 4,096-byte object fragments between contacts and requests only missing fragments after reauthentication. An incomplete encrypted message is retransmitted; an object is published and acknowledged only after full digest verification and durable storage. No automatic head or membership-policy promotion occurs.
 
 Application messages are segmented below Noise's per-message size limit, with bounded reassembly. The roles take ordered sending/receiving turns to avoid both peers blocking while sending bulk data. Inventory/object counts, aggregate bytes, frame sizes, connection and I/O waits are bounded. Large inventory and bidirectional object tests are required; small-message success alone is insufficient.
 
@@ -60,11 +62,13 @@ The first CLI scope is the node's opaque object inventory, potentially including
 
 ## Constrained contacts
 
-The constrained-link library models payload MTU, deterministic losses, duplicates, reordering, corruption and interrupted contacts. It accepts immutable object IDs and publishes only complete digest-verified objects into the same CAS. It enforces finite object/byte budgets. A later simulated or real carrier can resume at the level of completed object IDs, including objects delivered through offline bundles.
+The constrained-link library models payload MTU, deterministic losses, duplicates, reordering, corruption and interrupted contacts. It shares persistent fragment staging with live exchange and publishes only complete digest-verified objects into the same CAS. It enforces finite object/byte budgets. Complete objects delivered through offline bundles supersede incomplete state on the next receiver session.
 
-MTU in this simulator is payload-only; it does not include a real radio/SMS header. Incomplete fragment state is contact-local and retransmitted on the next contact. Persistent fragment-level resumption, link discovery, routing, battery/airtime behavior and real Bluetooth/radio/SMS adapters are not established by the simulation. No hardware support or delivery guarantee is implied.
+MTU in this simulator is payload-only; it does not include a real radio/SMS header. Keep it fixed for a partial object or explicitly discard that partial before changing it. Link discovery, routing, battery/airtime behavior and real radio/SMS adapters remain outside the simulation. The separate Linux RFCOMM adapter has implementation checks and a [hardware runbook](reliability-and-carriers.md#two-device-acceptance-runbook); over-the-air behavior and delivery guarantees remain unqualified.
 
 ## Verification and remaining limits
+
+The following record describes the earlier five-milestone implementation. The subsequent recovery/resumption sprint has a separate [profile and reproducible demonstration](reliability-and-carriers.md).
 
 On Linux with Rust/Cargo 1.99.0, strict Clippy passed and the full suite passed 35 tests across six test executables. After adding the final envelope-count guard, the complete device lifecycle regression passed again; formatting, strict Clippy and the CLI binary build also passed on that final source.
 
@@ -72,6 +76,6 @@ The checks cover legacy offline recovery, same-key chunk reuse and logical ident
 
 Separate source reviews examined the authority and transport integration. Their concrete findings were incorporated: invitation wire/signature separation, shared capture/transition locking, replay-versus-fork handling, payload-independent ancestry validation before head reduction, complementary inventory/request ordering, relative identity paths and bounded requested-object scope. A follow-up review of chain catch-up led to restoring the envelope-count bound before verification. These were bounded reviews of this integration, not an independent cryptographic audit or production certification.
 
-Policy-aware recovery export and automatic repair of interrupted membership transitions remain unimplemented. Partial-fragment persistence and real Bluetooth/radio/SMS adapters remain future work. No real personal collection, paid carrier, external peer, power-loss qualification or production deployment was exercised.
+At that checkpoint, policy-aware recovery export, repair and persistent fragments were still open. Those software gaps are addressed by the subsequent profile; physical carrier validation, independent security review and power-loss qualification remain open. No real personal collection, paid carrier, external peer or production deployment was exercised in that earlier verification.
 
 A separate 27-operation CLI exercise created an administrator and independently keyed writer, imported and selected a base, created two offline heads, synchronized over a pinned loopback Noise connection, explicitly merged them, revoked the writer, rejected a late revoked-device snapshot and restored retained history exactly after key rotation. Disposable binary and text fixtures were compared and removed. No outside peer or real personal collection was used.

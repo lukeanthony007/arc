@@ -51,13 +51,13 @@ fn offline_recovery_restores_exact_multichunk_snapshot_without_changing_head_on_
     );
 
     let kit = temp.path().join("keys.arc");
-    app::export_recovery(&node, &kit).unwrap();
+    app::export_recovery(&node, &kit, PASSWORD).unwrap();
     let package = temp.path().join("data.arc");
     app::export(&node, &second, &package).unwrap();
     let recovered = temp.path().join("recovered");
     app::recover(&recovered, &kit, &genesis, PASSWORD).unwrap();
     assert!(Store::open(&recovered).unwrap().head().unwrap().is_none());
-    assert!(app::verify(&recovered, &second, None).is_err());
+    assert!(app::verify(&recovered, &second, None).is_ok());
     let count = app::import(&recovered, &package).unwrap();
     assert!(count > 0);
     assert_eq!(app::import(&recovered, &package).unwrap(), count);
@@ -67,8 +67,12 @@ fn offline_recovery_restores_exact_multichunk_snapshot_without_changing_head_on_
             .unwrap()
             .materialized
     );
-    // Export carries ancestor descriptors but does not pretend to retain historic file bytes.
-    assert!(app::verify(&recovered, &first, Some(PASSWORD)).is_err());
+    // Complete recovery retains historical payloads as well as the selected export's ancestry.
+    assert!(
+        app::verify(&recovered, &first, Some(PASSWORD))
+            .unwrap()
+            .materialized
+    );
     let restored = temp.path().join("restored");
     app::restore(&recovered, &second, &restored, PASSWORD).unwrap();
     assert_eq!(fs::read(restored.join("notes/binary")).unwrap(), bytes);
@@ -98,7 +102,7 @@ fn corrupt_ciphertext_wrong_password_and_untrusted_root_fail_without_destination
     assert!(app::restore(&node, &snapshot, &target, "wrong password").is_err());
     assert!(!target.exists());
     let kit = temp.path().join("kit");
-    app::export_recovery(&node, &kit).unwrap();
+    app::export_recovery(&node, &kit, PASSWORD).unwrap();
     let wrong_node = temp.path().join("wrong");
     assert!(app::recover(&wrong_node, &kit, &[7; 32], PASSWORD).is_err());
     assert!(!wrong_node.exists());

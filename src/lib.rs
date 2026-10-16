@@ -4,13 +4,17 @@
 compile_error!("arc-exp-1 currently requires Linux filesystem semantics");
 
 pub mod app;
+pub mod bluetooth;
 pub mod bundle;
 pub mod constrained;
 pub mod crypto;
 pub mod devices;
 pub mod enrollment;
 pub mod format;
+pub mod fragments;
 pub mod history;
+pub(crate) mod membership;
 pub mod network;
 pub mod policy;
+pub mod recovery;
 pub mod store;

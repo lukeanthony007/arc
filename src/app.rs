@@ -915,45 +915,84 @@ pub fn import(path: &Path, source: &Path) -> Result<usize> {
     Ok(crate::bundle::import(&store, source)?.len())
 }
 
-/// Recovery carries no data: identity pin + existing encrypted key blob, independently authenticated.
-pub fn export_recovery(path: &Path, destination: &Path) -> Result<()> {
+/// Exports a password-authenticated kit of all locally stored immutable objects
+/// (64 MiB maximum), pinned policy/key controls and any member device key.
+/// Foreign, incomplete, or opaque local CAS objects are preserved verbatim; absent remote data is not included.
+/// Snapshot-head selection is not included or inferred during recovery.
+pub fn export_recovery(path: &Path, destination: &Path, password: &str) -> Result<()> {
     let store = Store::open(path)?;
-    let (genesis_id, genesis) = pinned(&store)?;
-    ensure!(
-        load_policy(&store, &genesis)?.is_none(),
-        "recovery kits for policy-managed collections are not supported"
-    );
-    let genesis_bytes = store.get(&genesis_id)?;
-    let keys = store.read_control("keys")?;
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let temporary = parent.join(format!(".arc-keys-{}", hex::encode(random_id())));
-    let mut output = OpenOptions::new()
+    let writer_lock = OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(false)
         .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(&temporary)?;
-    let result = (|| -> Result<()> {
-        output.write_all(b"ARCKEY1\n")?;
-        output.write_all(&genesis_id)?;
-        output.write_all(&(genesis_bytes.len() as u32).to_be_bytes())?;
-        output.write_all(&genesis_bytes)?;
-        output.write_all(&(keys.len() as u32).to_be_bytes())?;
-        output.write_all(&keys)?;
-        output.sync_all()?;
-        fs::hard_link(&temporary, destination)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    let _ = fs::remove_file(&temporary);
-    result
+        .custom_flags(
+            rustix::fs::OFlags::NOFOLLOW.bits() as i32 | rustix::fs::OFlags::NONBLOCK.bits() as i32,
+        )
+        .open(store.path().join("control/writer.lock"))?;
+    ensure!(writer_lock.metadata()?.is_file(), "invalid writer lock");
+    writer_lock
+        .try_lock()
+        .context("another local writer is active")?;
+    let (genesis_id, genesis) = pinned(&store)?;
+    match fs::symlink_metadata(store.path().join("control/membership-pending")) {
+        Ok(_) => bail!("membership or key rotation transition is pending"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let locked_keys = store.read_control("keys")?;
+    if let Some(policy) = load_policy(&store, &genesis)? {
+        let policy_id: Id = store
+            .read_control("policy")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid policy pin"))?;
+        let keys = crate::devices::secrets_for_policy(&store, policy_id, password)?;
+        ensure!(
+            policy
+                .members
+                .iter()
+                .any(|m| m.key == keys.root() && !m.revoked),
+            "node key is not active in current policy"
+        );
+        if keys.root() != genesis.root {
+            let f = OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    rustix::fs::OFlags::NOFOLLOW.bits() as i32
+                        | rustix::fs::OFlags::NONBLOCK.bits() as i32,
+                )
+                .open(store.path().join("device-key"))?;
+            ensure!(
+                f.metadata()?.is_file() && f.metadata()?.len() <= 256,
+                "invalid device key file"
+            );
+            let mut raw = Vec::new();
+            f.take(257).read_to_end(&mut raw)?;
+            let device = crate::crypto::DeviceSecrets::unlock(&raw, password)?;
+            ensure!(
+                device.public() == keys.root(),
+                "device key does not match member keys"
+            );
+        } else {
+            ensure!(
+                !store.path().join("device-key").exists(),
+                "admin recovery must not carry a member device key"
+            );
+        }
+    } else {
+        let unlocked = Secrets::unlock(&genesis.collection, &locked_keys, password)?;
+        ensure!(
+            unlocked.root() == genesis.root,
+            "recovery key/root mismatch"
+        );
+    }
+    crate::recovery::export(&store, &genesis_id, destination, password)
 }
 
-/// Explicitly reconstructs a new local node, requiring a separately supplied trusted genesis ID.
-/// It restores the same single-device identity: do not use the clone for concurrent publication.
+/// Reconstructs a fresh node using a separately supplied trusted genesis ID.
+/// The restored node retains the same identity: retire the original before reuse.
+/// The pin authenticates collection identity only, not global policy freshness.
 pub fn recover(path: &Path, kit: &Path, expected_genesis: &Id, password: &str) -> Result<()> {
     let mut input = OpenOptions::new()
         .read(true)
@@ -961,14 +1000,18 @@ pub fn recover(path: &Path, kit: &Path, expected_genesis: &Id, password: &str) -
             rustix::fs::OFlags::NOFOLLOW.bits() as i32 | rustix::fs::OFlags::NONBLOCK.bits() as i32,
         )
         .open(kit)?;
-    ensure!(
-        input.metadata()?.is_file()
-            && input.metadata()?.len() <= 2 * format::MAX_OBJECT as u64 + 48,
-        "invalid recovery kit file"
-    );
+    ensure!(input.metadata()?.is_file(), "invalid recovery kit file");
     let mut magic = [0; 8];
     input.read_exact(&mut magic)?;
+    if &magic == b"ARCRCV2\n" {
+        drop(input);
+        return crate::recovery::recover(path, kit, expected_genesis, password);
+    }
     ensure!(&magic == b"ARCKEY1\n", "unsupported recovery kit");
+    ensure!(
+        input.metadata()?.len() <= 2 * format::MAX_OBJECT as u64 + 48,
+        "invalid legacy recovery kit"
+    );
     let mut genesis_id = [0; 32];
     input.read_exact(&mut genesis_id)?;
     ensure!(
@@ -999,13 +1042,35 @@ pub fn recover(path: &Path, kit: &Path, expected_genesis: &Id, password: &str) -
         "recovery genesis digest mismatch"
     );
     let Record::Genesis(genesis) = format::inspect(&genesis_bytes)? else {
-        bail!("invalid recovery genesis");
+        bail!("invalid recovery genesis")
     };
     let keys = Secrets::unlock(&genesis.collection, &locked_keys, password)?;
     ensure!(keys.root() == genesis.root, "recovery key/root mismatch");
-    let store = Store::create(path)?;
-    store.put(&genesis_bytes)?;
-    store.write_new_control("keys", &locked_keys)?;
-    store.write_new_control("genesis", &genesis_id)?;
-    Ok(())
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let stage = parent.join(format!(".arc-legacy-recover-{}", hex::encode(random_id())));
+    let mut created = false;
+    let result = (|| -> Result<()> {
+        let store = Store::create(&stage)?;
+        created = true;
+        store.put(&genesis_bytes)?;
+        store.write_new_control("keys", &locked_keys)?;
+        store.write_new_control("genesis", &genesis_id)?;
+        File::open(&stage)?.sync_all()?;
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &stage,
+            rustix::fs::CWD,
+            path,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if created && result.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    result
 }

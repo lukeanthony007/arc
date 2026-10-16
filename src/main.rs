@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 #[command(
     name = "arc",
     version,
-    about = "Experimental encrypted snapshots and offline transfer (arc-exp-1)"
+    about = "Experimental encrypted storage, recoverable membership and resumable sync"
 )]
 struct Cli {
     /// Read one password line from standard input instead of a terminal prompt.
@@ -47,7 +47,7 @@ enum Command {
     },
     /// Import opaque objects without changing collection identity or selecting a current head.
     Import { node: PathBuf, source: PathBuf },
-    /// Export the existing password-protected root/data keys; carries NO file content.
+    /// Export an authenticated encrypted backup of retained objects, identity, policy and keys.
     RecoveryExport { node: PathBuf, destination: PathBuf },
     /// Recover a node using an encrypted kit and a separately trusted genesis ID.
     /// Restores the SAME device identity; keep the old writer offline.
@@ -90,6 +90,20 @@ enum Command {
         identity: PathBuf,
         peer_key: String,
     },
+    /// Exchange encrypted objects through an explicitly prepared Linux /dev/rfcommN endpoint.
+    BluetoothSync {
+        node: PathBuf,
+        endpoint: PathBuf,
+        identity: PathBuf,
+        peer_key: String,
+        /// Act as the Noise responder; the peer must act as initiator.
+        #[arg(long)]
+        respond: bool,
+    },
+    /// Complete an authenticated interrupted membership transaction; never erase an unknown guard.
+    Repair { node: PathBuf },
+    /// Discard one incomplete object's staged fragments, leaving verified objects unchanged.
+    PartialDiscard { node: PathBuf, object: String },
     /// Activate signed device policy on an administrator node.
     EnablePolicy { node: PathBuf },
     /// Generate independent signing/envelope keys and a public enrollment request.
@@ -272,8 +286,11 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::RecoveryExport { node, destination } => {
-            app::export_recovery(&node, &destination)?;
-            println!("exported password-protected root/data keys; file content excluded");
+            let secret = password(cli.password_stdin, false)?;
+            app::export_recovery(&node, &destination, &secret)?;
+            println!(
+                "exported authenticated recovery backup; keep it private and retire the original identity before recovery"
+            );
         }
         Command::Recover {
             node,
@@ -283,7 +300,7 @@ fn run(cli: Cli) -> Result<()> {
             let secret = password(cli.password_stdin, false)?;
             app::recover(&node, &kit, &format::parse_id(&trust_genesis)?, &secret)?;
             println!(
-                "recovered same single-device identity; no data imported and no current head selected"
+                "recovered the backed-up device identity; policy freshness beyond the backup is unknown; retire the original device before publishing"
             );
         }
         Command::History { node } => {
@@ -375,6 +392,38 @@ fn run(cli: Cli) -> Result<()> {
                 &inventory(&store)?,
             )?;
             println!("{report:?}; imported bytes do not change trust or selected head");
+        }
+        Command::BluetoothSync {
+            node,
+            endpoint,
+            identity,
+            peer_key,
+            respond,
+        } => {
+            let password = password(cli.password_stdin, false)?;
+            let secret = arc_store::network::identity_load(&identity, &password)?;
+            let peer = format::parse_id(&peer_key)?;
+            let store = arc_store::store::Store::open(&node)?;
+            let ids = inventory(&store)?;
+            let report = if respond {
+                arc_store::bluetooth::accept(&endpoint, &store, &*secret, &peer, &ids)?
+            } else {
+                arc_store::bluetooth::connect(&endpoint, &store, &*secret, &peer, &ids)?
+            };
+            println!("{report:?}; imported bytes do not change trust or selected head");
+        }
+        Command::Repair { node } => {
+            let secret = password(cli.password_stdin, false)?;
+            arc_store::devices::repair(&node, &secret)?;
+            println!(
+                "membership transaction repaired or no pending transaction; unknown guards remain blocked"
+            );
+        }
+        Command::PartialDiscard { node, object } => {
+            let store = arc_store::store::Store::open(&node)?;
+            let receiver = arc_store::fragments::Receiver::open(&store.path().join("incoming"))?;
+            receiver.discard(&format::parse_id(&object)?)?;
+            println!("discarded selected incomplete object state; verified objects unchanged");
         }
         Command::EnablePolicy { node } => {
             let secret = password(cli.password_stdin, false)?;

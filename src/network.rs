@@ -34,22 +34,64 @@ pub struct SyncReport {
     pub sent: usize,
     pub received: usize,
     pub skipped: usize,
+    pub fragments_sent: usize,
+    pub fragments_received: usize,
+    pub fragments_reused: usize,
 }
 fn params() -> Result<NoiseParams> {
     PARAMS.parse().context("Noise parameters")
 }
-fn setup(s: &mut TcpStream) -> Result<()> {
-    s.set_read_timeout(Some(TIMEOUT))?;
-    s.set_write_timeout(Some(TIMEOUT))?;
-    Ok(())
+struct TcpContact {
+    stream: TcpStream,
+    deadline: Instant,
 }
-fn write_frame(s: &mut TcpStream, b: &[u8]) -> Result<()> {
+impl TcpContact {
+    fn new(stream: TcpStream) -> Result<Self> {
+        stream.set_nodelay(true)?;
+        Ok(Self {
+            stream,
+            deadline: Instant::now() + TIMEOUT,
+        })
+    }
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TCP contact deadline reached",
+            ));
+        }
+        Ok(remaining)
+    }
+}
+impl Read for TcpContact {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(out)
+    }
+}
+impl Write for TcpContact {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+fn write_frame<S: Write>(s: &mut S, b: &[u8]) -> Result<()> {
     ensure!(b.len() <= MAX_FRAME, "frame exceeds limit");
     s.write_all(&(b.len() as u32).to_be_bytes())?;
     s.write_all(b)?;
     Ok(())
 }
-fn read_frame(s: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_frame<S: Read>(s: &mut S) -> Result<Vec<u8>> {
     let mut n = [0; 4];
     s.read_exact(&mut n)?;
     let n = u32::from_be_bytes(n) as usize;
@@ -59,7 +101,7 @@ fn read_frame(s: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(b)
 }
 const MSG_CHUNK: usize = 60_000;
-fn send_msg(s: &mut TcpStream, t: &mut snow::TransportState, b: &[u8]) -> Result<()> {
+fn send_msg<S: Write>(s: &mut S, t: &mut snow::TransportState, b: &[u8]) -> Result<()> {
     ensure!(b.len() <= MAX_FRAME, "message exceeds limit");
     let total = (b.len() as u32).to_be_bytes();
     let mut first = Vec::with_capacity(MSG_CHUNK);
@@ -78,7 +120,7 @@ fn send_msg(s: &mut TcpStream, t: &mut snow::TransportState, b: &[u8]) -> Result
     }
     Ok(())
 }
-fn recv_msg(s: &mut TcpStream, t: &mut snow::TransportState) -> Result<Vec<u8>> {
+fn recv_msg<S: Read>(s: &mut S, t: &mut snow::TransportState) -> Result<Vec<u8>> {
     let frame = read_frame(s)?;
     let mut out = vec![0; frame.len()];
     let n = t.read_message(&frame, &mut out)?;
@@ -100,8 +142,8 @@ fn recv_msg(s: &mut TcpStream, t: &mut snow::TransportState) -> Result<Vec<u8>> 
     ensure!(result.len() == total, "invalid message length");
     Ok(result)
 }
-fn handshake_client(
-    s: &mut TcpStream,
+fn handshake_client<S: Read + Write>(
+    s: &mut S,
     secret: &[u8],
     pinned: &[u8],
 ) -> Result<snow::TransportState> {
@@ -113,16 +155,16 @@ fn handshake_client(
     write_frame(s, &buf[..n])?;
     let b = read_frame(s)?;
     h.read_message(&b, &mut buf)?;
-    let n = h.write_message(&[], &mut buf)?;
-    write_frame(s, &buf[..n])?;
     ensure!(
         h.get_remote_static() == Some(pinned),
         "peer transport key mismatch"
     );
+    let n = h.write_message(&[], &mut buf)?;
+    write_frame(s, &buf[..n])?;
     Ok(h.into_transport_mode()?)
 }
-fn handshake_server(
-    s: &mut TcpStream,
+fn handshake_server<S: Read + Write>(
+    s: &mut S,
     secret: &[u8],
     pinned: &[u8],
 ) -> Result<snow::TransportState> {
@@ -177,8 +219,10 @@ fn parse_ids(b: &[u8]) -> Result<Vec<Id>> {
     validate_ids(&ids)?;
     Ok(ids)
 }
-fn send_objects(
-    s: &mut TcpStream,
+const WIRE_FRAGMENT: u32 = 4096;
+const WIRE_PROFILE: &[u8] = b"arc-exp-2/fragment-sync\0";
+fn send_objects<S: Read + Write>(
+    s: &mut S,
     t: &mut snow::TransportState,
     store: &Store,
     ids: &[Id],
@@ -186,50 +230,114 @@ fn send_objects(
 ) -> Result<()> {
     let mut total = 0u64;
     for id in ids {
-        let b = store.get(id)?;
-        total += b.len() as u64;
+        let bytes = store.get(id)?;
+        total += bytes.len() as u64;
         ensure!(total <= MAX_TOTAL, "send quota exceeded");
-        let mut record = Vec::with_capacity(32 + b.len());
-        record.extend_from_slice(id);
-        record.extend_from_slice(&b);
-        send_msg(s, t, &record)?;
+        let mut header = id.to_vec();
+        header.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        header.extend_from_slice(&WIRE_FRAGMENT.to_be_bytes());
+        send_msg(s, t, &header)?;
+        let request = recv_msg(s, t)?;
+        ensure!(request.len() >= 4, "truncated fragment request");
+        let n = u32::from_be_bytes(request[..4].try_into()?) as usize;
+        let count = bytes.len().max(1).div_ceil(WIRE_FRAGMENT as usize);
+        ensure!(
+            n <= count && request.len() == 4 + n * 4,
+            "invalid fragment request"
+        );
+        let mut previous = None;
+        for raw in request[4..].as_chunks::<4>().0 {
+            let index = u32::from_be_bytes(*raw);
+            ensure!(
+                (index as usize) < count && previous.is_none_or(|p| p < index),
+                "invalid requested fragment index"
+            );
+            previous = Some(index);
+            let start = index as usize * WIRE_FRAGMENT as usize;
+            let end = (start + WIRE_FRAGMENT as usize).min(bytes.len());
+            let mut fragment = index.to_be_bytes().to_vec();
+            fragment.extend_from_slice(&bytes[start..end]);
+            send_msg(s, t, &fragment)?;
+            report.fragments_sent += 1;
+        }
+        report.fragments_reused += count - n;
+        ensure!(
+            recv_msg(s, t)?.as_slice() == id,
+            "missing durable object acknowledgement"
+        );
         report.sent += 1;
     }
     Ok(())
 }
-fn receive_objects(
-    s: &mut TcpStream,
+fn receive_objects<S: Read + Write>(
+    s: &mut S,
     t: &mut snow::TransportState,
     store: &Store,
     ids: &[Id],
     report: &mut SyncReport,
 ) -> Result<()> {
     let mut total = 0u64;
+    let mut receiver = crate::fragments::Receiver::open(&store.path().join("incoming"))?;
     for id in ids {
-        let record = recv_msg(s, t)?;
+        let header = recv_msg(s, t)?;
         ensure!(
-            record.len() >= 32 && record[..32] == id[..],
-            "unexpected object response"
+            header.len() == 44 && header[..32] == id[..],
+            "unexpected object header"
         );
-        let b = &record[32..];
+        let size = u64::from_be_bytes(header[32..40].try_into()?);
+        let fragment_size = u32::from_be_bytes(header[40..44].try_into()?);
         ensure!(
-            b.len() <= MAX_OBJECT && crate::format::id(b) == *id,
-            "invalid received object"
+            size <= MAX_OBJECT as u64 && fragment_size == WIRE_FRAGMENT,
+            "unsupported object size or fragment profile"
         );
-        total += b.len() as u64;
+        total += size;
         ensure!(total <= MAX_TOTAL, "receive quota exceeded");
-        store.put(b)?;
+        let missing = receiver.missing(id, size, fragment_size)?;
+        let mut request = (missing.len() as u32).to_be_bytes().to_vec();
+        for index in &missing {
+            request.extend_from_slice(&index.to_be_bytes());
+        }
+        send_msg(s, t, &request)?;
+        for index in missing {
+            let fragment = recv_msg(s, t)?;
+            ensure!(
+                fragment.len() >= 4 && u32::from_be_bytes(fragment[..4].try_into()?) == index,
+                "unexpected object fragment"
+            );
+            receiver.accept(id, size, fragment_size, index, &fragment[4..])?;
+            report.fragments_received += 1;
+        }
+        ensure!(
+            store.contains(id)?,
+            "received object did not pass complete digest verification"
+        );
+        send_msg(s, t, id)?;
         report.received += 1;
     }
     Ok(())
 }
-fn exchange(
-    s: &mut TcpStream,
+fn exchange<S: Read + Write>(
+    s: &mut S,
     t: &mut snow::TransportState,
     store: &Store,
     ids: &[Id],
     initiator: bool,
 ) -> Result<SyncReport> {
+    // Negotiate the experimental application profile after pin verification.
+    // Older whole-object peers fail explicitly instead of misreading fragments.
+    if initiator {
+        send_msg(s, t, WIRE_PROFILE)?;
+        ensure!(
+            recv_msg(s, t)? == WIRE_PROFILE,
+            "unsupported synchronization profile"
+        );
+    } else {
+        ensure!(
+            recv_msg(s, t)? == WIRE_PROFILE,
+            "unsupported synchronization profile"
+        );
+        send_msg(s, t, WIRE_PROFILE)?;
+    }
     let local_inventory = ids_message(ids)?;
     let remote = if initiator {
         send_msg(s, t, &local_inventory)?;
@@ -265,6 +373,22 @@ fn exchange(
     }
     Ok(report)
 }
+/// Run the authenticated one-shot exchange over a caller-provided bounded byte stream.
+pub fn sync_stream<S: Read + Write>(
+    stream: &mut S,
+    store: &Store,
+    secret: &[u8],
+    pinned_peer: &[u8],
+    ids: &[Id],
+    initiator: bool,
+) -> Result<SyncReport> {
+    let mut transport = if initiator {
+        handshake_client(stream, secret, pinned_peer)?
+    } else {
+        handshake_server(stream, secret, pinned_peer)?
+    };
+    exchange(stream, &mut transport, store, ids, initiator)
+}
 /// Connect to an explicitly selected peer; no background task or listener is created.
 pub fn sync_client(
     addr: SocketAddr,
@@ -273,8 +397,7 @@ pub fn sync_client(
     pinned_peer: &[u8],
     ids: &[Id],
 ) -> Result<SyncReport> {
-    let mut s = TcpStream::connect_timeout(&addr, TIMEOUT)?;
-    setup(&mut s)?;
+    let mut s = TcpContact::new(TcpStream::connect_timeout(&addr, TIMEOUT)?)?;
     let mut t = handshake_client(&mut s, secret, pinned_peer)?;
     exchange(&mut s, &mut t, store, ids, true)
 }
@@ -298,8 +421,8 @@ pub fn serve_once(
         }
     };
     listener.set_nonblocking(false)?;
-    let (mut s, _) = accepted?;
-    setup(&mut s)?;
+    let (stream, _) = accepted?;
+    let mut s = TcpContact::new(stream)?;
     let mut t = handshake_server(&mut s, secret, pinned_peer)?;
     exchange(&mut s, &mut t, store, ids, false)
 }
@@ -410,5 +533,22 @@ mod tests {
         assert!(validate_requests(&[a], &[b]).is_err());
         assert!(validate_ids(&[a, a]).is_err());
         assert!(validate_requests(&[a, b], &[a, a]).is_err());
+    }
+    #[test]
+    fn tcp_deadline_does_not_reset_after_progress() {
+        use std::{
+            io::Read,
+            net::{TcpListener, TcpStream},
+            time::{Duration, Instant},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut contact = super::TcpContact::new(stream).unwrap();
+        contact.deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            contact.read(&mut [0; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 }

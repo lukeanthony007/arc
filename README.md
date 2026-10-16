@@ -14,7 +14,7 @@ A **collection** is a set of files with its own identity, keys and version histo
 
 Arc encrypts content before it leaves a node. Signed records establish who can publish a version; hashes and authenticated encryption detect altered data. A recipient checks the objects and their authorization before treating a snapshot as valid.
 
-The carrier delivers bytes. It does not decide who may read them or which version becomes current. Today, Arc supports offline transfer files and authenticated TCP connections. Bluetooth, radio and SMS are future adapter targets, each with its own bandwidth and delivery constraints.
+The carrier delivers bytes. It does not decide who may read them or which version becomes current. Arc supports offline transfer files, authenticated TCP connections and an explicit Linux Bluetooth RFCOMM endpoint adapter. The Bluetooth implementation awaits over-the-air qualification; radio and SMS adapters remain future work.
 
 For example, two laptops can start with the same collection and make changes while disconnected. When they exchange data, Arc preserves both branches. You inspect the differences, prepare a resolved folder and capture a merge that records both parents. Importing data never silently replaces your selected version or writes over your working files.
 
@@ -27,7 +27,8 @@ Storage and exchange need no mandatory server. Each private collection currently
 - **Reusable encrypted chunks.** Repeated captures reuse unchanged blocks at the same file offset while the content key remains the same. Rotation forces fresh encryption.
 - **Independent devices.** Enroll readers or writers, distribute signed policy updates, revoke members and rotate content keys.
 - **Offline and live exchange.** Export opaque transfer bundles or connect to a peer whose transport key you have explicitly verified. Live synchronization requests missing objects.
-- **Interrupted-transfer progress.** Complete verified objects survive interrupted contacts. A constrained-link simulator exercises loss, duplication, reordering and corruption.
+- **Interrupted-transfer progress.** Durable partial objects survive reconnects and receiver restarts in TCP, RFCOMM and constrained simulations. Reconnects request missing fragments, and only complete verified objects enter the store.
+- **Recovery and repair.** Create a password-authenticated backup of retained objects, membership state and keys; recover to a fresh node, or explicitly complete a journaled membership update interrupted between writes.
 
 Arc currently uses deliberate CLI operations. Automatic folder watching, background synchronization and peer discovery are outside this implementation.
 
@@ -83,18 +84,20 @@ The [device and sync guide](docs/device-and-sync-profile.md) describes the workf
 - **Maintain access:** `refresh`, `revoke` and `apply-policy`. Keep public enrollment requests for subsequent key distribution; deliver policy updates explicitly.
 - **Connect two nodes:** `network-identity`, `serve-once` and `sync`. Verify each peer's full public transport key separately. The listener handles one foreground exchange and exits.
 - **Resolve offline work:** `history`, `diff`, `select` and `merge`. Supply the resolved directory and every parent the merge resolves.
+- **Recover or repair:** `recovery-export`, `recover` and `repair`. The [reliability guide](docs/reliability-and-carriers.md) explains backup contents, identity retirement and which interrupted states can be repaired.
+- **Use Bluetooth:** `bluetooth-sync` exchanges through an explicitly prepared `/dev/rfcommN` endpoint. Arc handles the encrypted session, not pairing or discovery.
 
 Transport identity and collection membership are separate. A live exchange transfers the chosen node's opaque object inventory, which can include ciphertext previously imported into that node. It excludes private keys and local control files, and does not automatically apply membership updates or select a new head.
 
-For the original single-device recovery flow, see the [base implementation profile](docs/experimental-profile.md). Recovery recreates the same device identity; use enrollment to add an independent device.
+Recovery recreates the backed-up device identity; use enrollment to add an independent device. New complete backups contain the retained object inventory and policy/key state. Legacy keys-only backups remain readable. Neither proves that the backed-up policy is still current elsewhere.
 
 ## Current boundaries and next work
 
 Revocation takes effect as devices receive the new policy. It cannot erase plaintext or keys a former member already holds. Granting a content key can also expose historical ciphertext encrypted with that key; access is currently collection-wide.
 
-Remaining reliability work includes recovery export for collections with device membership, repair of interrupted membership changes, and persistent resumption of incomplete object fragments. Today, policy-managed recovery export is refused, interrupted membership changes block normal operations pending manual recovery, and only complete verified objects persist across transfer attempts.
+Journal repair covers newly prepared membership transitions. Legacy incomplete markers and signed-policy forks remain blocked for investigation. Backups are bounded and buffered in memory; missing historical keys or objects cannot be recreated.
 
-Real Bluetooth, radio and SMS adapters remain unimplemented. The simulator does not establish hardware support, routing behavior or delivery guarantees. Stable formats, independent security review and power-loss qualification also remain open.
+Physical two-device and Bluetooth validation remain pending. The [hardware runbook](docs/reliability-and-carriers.md#two-device-acceptance-runbook) separates those checks from local process, pseudoterminal and simulator verification. Stable formats, independent security review and power-loss qualification also remain open.
 
 ## Development and verification
 
@@ -104,7 +107,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-The five-milestone implementation passed 35 tests across six executables and a separate 27-operation CLI exercise covering independent devices, offline branches, live exchange, merging, revocation and historical restore. The [verification record](docs/device-and-sync-profile.md#verification-and-remaining-limits) distinguishes full-suite results, final follow-up checks and remaining gaps.
+The [earlier verification record](docs/device-and-sync-profile.md#verification-and-remaining-limits) covers the original 35-test implementation and 27-operation CLI exercise. For the recovery/resumption sprint, run `python3 tools/sprint_demo.py` after building; its disposable local workflow is described in the [reliability guide](docs/reliability-and-carriers.md). A successful local run does not qualify physical carriers.
 
 ## Read the design
 
@@ -113,6 +116,7 @@ The implementation profiles describe current behavior. The architecture document
 - [Architecture](DESIGN.md): purpose, trust boundaries, node roles and the broader design.
 - [Base implementation](docs/experimental-profile.md): storage format, capture, verification, transfer and single-device recovery.
 - [Device and sync implementation](docs/device-and-sync-profile.md): membership, keys, history, merges and live exchange.
+- [Recovery and carriers](docs/reliability-and-carriers.md): complete backups, journal repair, persistent fragments and the two-device hardware runbook.
 - [Data and synchronization](docs/data-and-sync.md): objects, versions, conflicts and transfer design.
 - [Security and keys](docs/security.md): threat model, authorization, recovery and metadata limits.
 - [Operations and validation](docs/operations-and-validation.md): durability, safe restore and acceptance scenarios.
